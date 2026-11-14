@@ -40,6 +40,7 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
+import java.util.zip.GZIPInputStream
 import kotlin.math.abs
 
 /** Implemented by MainActivity so the WebView can go fullscreen (landscape, bars hidden). */
@@ -67,7 +68,7 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
 
     key(videoId) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            // 1. TOP: Your exact working YouTube WebView (untouched)
+            // 1. TOP: Working 16:9 YouTube WebView (untouched)
             AndroidView(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -107,7 +108,7 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
                 },
             )
 
-            // 2. BOTTOM: Separate Local AI Q&A section
+            // 2. BOTTOM: Local AI Video Q&A Section
             AndroidView(
                 modifier = Modifier.fillMaxWidth(),
                 factory = { ctx ->
@@ -130,6 +131,7 @@ private class LocalAiPanelView(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor = Executors.newCachedThreadPool()
     private val openedAtMs = System.currentTimeMillis()
+    private val fetchLock = Any()
 
     private val statusText: TextView
     private val engineBadge: TextView
@@ -140,6 +142,9 @@ private class LocalAiPanelView(
 
     @Volatile
     private var videoMeta = VideoMetadata(videoId = videoId)
+
+    @Volatile
+    private var isFetchingMeta = true
 
     @Volatile
     private var mediaPipeLlmInstance: Any? = null
@@ -184,12 +189,16 @@ private class LocalAiPanelView(
         headerRow.addView(engineBadge)
         addView(headerRow)
 
-        // Transcript & Video Status
+        // Transcript & Video Status (tap to retry if needed)
         statusText = TextView(context).apply {
-            text = "Loading video transcript & details..."
+            text = "⏳ Loading video transcript & captions..."
             setTextColor(Color.parseColor("#9E9E9E"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, dp(4), 0, dp(8))
+            setOnClickListener {
+                text = "🔄 Retrying transcript download..."
+                loadVideoMetadataAndTranscript(forceRetry = true)
+            }
         }
         addView(statusText)
 
@@ -315,7 +324,7 @@ private class LocalAiPanelView(
             message = "Ask me anything about this video! Tap a chip above or type a question below."
         )
 
-        loadVideoMetadataAndTranscript()
+        loadVideoMetadataAndTranscript(forceRetry = false)
         detectLocalAiBackends(showToastInChat = false)
     }
 
@@ -323,25 +332,40 @@ private class LocalAiPanelView(
         return ((System.currentTimeMillis() - openedAtMs) / 1000L).toInt().coerceAtLeast(0)
     }
 
-    private fun loadVideoMetadataAndTranscript() {
+    private fun loadVideoMetadataAndTranscript(forceRetry: Boolean) {
         executor.execute {
+            val fetched = ensureMetadataLoaded(forceRetry)
+            mainHandler.post {
+                updateStatusBanner(fetched)
+            }
+        }
+    }
+
+    private fun ensureMetadataLoaded(forceRetry: Boolean = false): VideoMetadata {
+        synchronized(fetchLock) {
+            if (!forceRetry && !isFetchingMeta && (videoMeta.cues.isNotEmpty() || videoMeta.description.isNotBlank())) {
+                return videoMeta
+            }
+            isFetchingMeta = true
             val fetched = fetchYouTubeContext(videoId)
             videoMeta = fetched
-            mainHandler.post {
-                val titleDisplay = if (fetched.title.isNotBlank()) fetched.title else "Video $videoId"
-                val cueCount = fetched.cues.size
-                statusText.text = if (cueCount > 0) {
-                    "📺 $titleDisplay\n✓ $cueCount caption lines loaded for Q&A"
-                } else {
-                    "📺 $titleDisplay\nℹ️ Using video title & description for Q&A"
-                }
-            }
+            isFetchingMeta = false
+            return fetched
+        }
+    }
+
+    private fun updateStatusBanner(meta: VideoMetadata) {
+        val titleDisplay = if (meta.title.isNotBlank()) meta.title else "Video $videoId"
+        val cueCount = meta.cues.size
+        statusText.text = when {
+            cueCount > 0 -> "📺 $titleDisplay\n✅ $cueCount caption lines loaded for Q&A"
+            meta.description.isNotBlank() -> "📺 $titleDisplay\nℹ️ Captions unavailable; description loaded (${meta.description.length} chars) — tap to retry"
+            else -> "📺 $titleDisplay\n⚠️ Captions didn't load — tap here to retry"
         }
     }
 
     private fun detectLocalAiBackends(showToastInChat: Boolean) {
         executor.execute {
-            // 1. Check Localhost Ollama on phone (127.0.0.1:11434)
             val detectedOllama = checkLocalOllamaModel()
             if (detectedOllama != null) {
                 ollamaModelName = detectedOllama
@@ -354,7 +378,6 @@ private class LocalAiPanelView(
                 return@execute
             }
 
-            // 2. Check On-Device MediaPipe LLM (.task / .bin in Download or filesDir)
             if (mediaPipeLlmInstance == null) {
                 val modelFile = findOnDeviceModelFile(context)
                 if (modelFile != null) {
@@ -374,7 +397,6 @@ private class LocalAiPanelView(
                 return@execute
             }
 
-            // 3. Built-in Offline Transcript AI
             mainHandler.post {
                 engineBadge.text = "⚡ Built-in Transcript AI"
                 if (showToastInChat) {
@@ -396,15 +418,18 @@ private class LocalAiPanelView(
         val thinkingView = appendChatBubble("AI", "Thinking...")
 
         executor.execute {
-            val relevantContext = buildContextWindow(videoMeta, currentSec)
+            val meta = if (videoMeta.cues.isEmpty()) ensureMetadataLoaded(forceRetry = true) else videoMeta
+            mainHandler.post { updateStatusBanner(meta) }
+
+            val relevantContext = buildContextWindow(meta, currentSec)
             val prompt = """
                 You are a concise video assistant running locally on a phone.
                 Answer the user's question based on the video context below.
                 
-                Video Title: ${videoMeta.title.ifBlank { videoId }}
-                Channel: ${videoMeta.author.ifBlank { "Unknown" }}
+                Video Title: ${meta.title.ifBlank { videoId }}
+                Channel: ${meta.author.ifBlank { "Unknown" }}
                 Approx Playback Time: $timeFormatted
-                Description: ${videoMeta.description.take(500)}
+                Description: ${meta.description.take(600)}
                 
                 Transcript Excerpt:
                 $relevantContext
@@ -415,11 +440,11 @@ private class LocalAiPanelView(
             val answer = when {
                 ollamaModelName != null -> {
                     queryLocalOllama(ollamaModelName!!, prompt)
-                        ?: answerWithBuiltInTranscriptAi(question, videoMeta, currentSec)
+                        ?: answerWithBuiltInTranscriptAi(question, meta, currentSec)
                 }
                 mediaPipeLlmInstance != null -> {
                     queryMediaPipeLlm(mediaPipeLlmInstance!!, prompt)
-                        ?: answerWithBuiltInTranscriptAi(question, videoMeta, currentSec)
+                        ?: answerWithBuiltInTranscriptAi(question, meta, currentSec)
                 }
                 else -> {
                     val freshOllama = checkLocalOllamaModel()
@@ -427,9 +452,9 @@ private class LocalAiPanelView(
                         ollamaModelName = freshOllama
                         mainHandler.post { engineBadge.text = "🟢 Ollama: $freshOllama" }
                         queryLocalOllama(freshOllama, prompt)
-                            ?: answerWithBuiltInTranscriptAi(question, videoMeta, currentSec)
+                            ?: answerWithBuiltInTranscriptAi(question, meta, currentSec)
                     } else {
-                        answerWithBuiltInTranscriptAi(question, videoMeta, currentSec)
+                        answerWithBuiltInTranscriptAi(question, meta, currentSec)
                     }
                 }
             }
@@ -442,24 +467,29 @@ private class LocalAiPanelView(
     }
 
     private fun showCurrentTranscriptExcerpt() {
-        val cues = videoMeta.cues
-        if (cues.isEmpty()) {
-            appendChatBubble(
-                "AI",
-                if (videoMeta.description.isNotBlank()) {
-                    "No closed captions found. Video description:\n\n${videoMeta.description.take(600)}"
-                } else {
-                    "No transcript or captions were found for this video."
-                }
-            )
-            return
+        val loadingBubble = appendChatBubble("AI", "Loading transcript excerpt...")
+        executor.execute {
+            val meta = if (videoMeta.cues.isEmpty()) ensureMetadataLoaded(forceRetry = true) else videoMeta
+            val currentSec = estimatedPlaybackSec()
+
+            val resultText = if (meta.cues.isNotEmpty()) {
+                val minSec = (currentSec - 90).coerceAtLeast(0)
+                val maxSec = currentSec + 120
+                val nearby = meta.cues.filter { it.startSec in minSec..maxSec }.ifEmpty { meta.cues.take(20) }
+                "Transcript (${meta.cues.size} total lines):\n" +
+                    nearby.take(25).joinToString("\n") { "[${formatSec(it.startSec)}] ${it.text}" }
+            } else if (meta.description.isNotBlank()) {
+                "No closed-caption track returned; video description:\n\n${meta.description.take(700)}"
+            } else {
+                "Could not load captions for ${meta.title.ifBlank { videoId }}. Check connection and tap the status bar above to retry."
+            }
+
+            mainHandler.post {
+                updateStatusBanner(meta)
+                loadingBubble.text = resultText
+                chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+            }
         }
-        val currentSec = estimatedPlaybackSec()
-        val minSec = (currentSec - 90).coerceAtLeast(0)
-        val maxSec = currentSec + 90
-        val nearby = cues.filter { it.startSec in minSec..maxSec }.ifEmpty { cues.take(15) }
-        val snippet = nearby.take(20).joinToString("\n") { "[${formatSec(it.startSec)}] ${it.text}" }
-        appendChatBubble("Transcript", snippet)
     }
 
     private fun appendChatBubble(sender: String, message: String, isUser: Boolean = false): TextView {
@@ -483,7 +513,7 @@ private class LocalAiPanelView(
 
     private fun buildContextWindow(meta: VideoMetadata, currentSec: Int): String {
         if (meta.cues.isEmpty()) {
-            return meta.description.ifBlank { "No transcript available." }.take(1500)
+            return meta.description.ifBlank { "Video Title: ${meta.title} by ${meta.author}" }.take(1500)
         }
         val minSec = (currentSec - 180).coerceAtLeast(0)
         val maxSec = currentSec + 180
@@ -500,57 +530,54 @@ private class LocalAiPanelView(
         val qLower = question.lowercase()
         val allCues = meta.cues
 
-        if (allCues.isEmpty() && meta.description.isBlank()) {
-            return "Transcript is still loading or unavailable for this video (${meta.title.ifBlank { videoId }})."
-        }
-
         if (qLower.contains("current") || qLower.contains("right now") || qLower.contains("this part")) {
             if (allCues.isNotEmpty()) {
                 val nearby = allCues.filter { abs(it.startSec - currentSec) <= 60 }
-                    .ifEmpty { allCues.take(8) }
-                val joined = nearby.take(10).joinToString(" ") { it.text }
-                return "Around [${formatSec(currentSec)}], the video discusses:\n\"$joined\""
+                    .ifEmpty { allCues.take(10) }
+                val joined = nearby.take(12).joinToString(" ") { it.text }
+                return "Around [${formatSec(currentSec)}], the speaker says:\n\"$joined\""
             }
         }
 
-        if (qLower.contains("summar") || qLower.contains("takeaway") || qLower.contains("about")) {
+        if (qLower.contains("summar") || qLower.contains("takeaway") || qLower.contains("about") || qLower.contains("point")) {
             val sb = StringBuilder()
-            if (meta.title.isNotBlank()) sb.append("• Title: ${meta.title}\n")
-            if (meta.author.isNotBlank()) sb.append("• Channel: ${meta.author}\n")
+            if (meta.title.isNotBlank()) sb.append("• Video: ${meta.title}\n")
+            if (meta.author.isNotBlank()) sb.append("• Speaker / Channel: ${meta.author}\n")
             if (allCues.isNotEmpty()) {
-                val step = (allCues.size / 4).coerceAtLeast(1)
-                val samples = listOfNotNull(
-                    allCues.getOrNull(0),
-                    allCues.getOrNull(step),
-                    allCues.getOrNull(step * 2),
-                    allCues.getOrNull(step * 3)
-                ).distinctBy { it.startSec }
+                val total = allCues.size
+                val indices = listOf(0, total / 5, (total * 2) / 5, (total * 3) / 5, (total * 4) / 5)
+                    .distinct()
+                    .filter { it in allCues.indices }
 
-                sb.append("• Key points across the video:\n")
-                for (cue in samples) {
-                    sb.append("  [${formatSec(cue.startSec)}] ${cue.text}\n")
+                sb.append("• Key highlights across the talk:\n")
+                for (idx in indices) {
+                    val chunk = allCues.subList(idx, (idx + 3).coerceAtMost(total))
+                    val text = chunk.joinToString(" ") { it.text }
+                    sb.append("  [${formatSec(chunk.first().startSec)}] $text\n")
                 }
             } else if (meta.description.isNotBlank()) {
-                sb.append("• Overview: ${meta.description.take(350)}")
+                sb.append("• Overview: ${meta.description.take(450)}")
+            } else {
+                sb.append("• Topic: ${meta.title}")
             }
             return sb.toString().trim()
         }
 
         val stopWords = setOf(
             "what", "when", "where", "which", "who", "whom", "this", "that", "these",
-            "those", "does", "about", "video", "explain", "tell", "from", "with", "have"
+            "those", "does", "about", "video", "explain", "tell", "from", "with", "have", "how", "why"
         )
         val keywords = qLower.split(Regex("[^a-z0-9]+"))
-            .filter { it.length >= 3 && it !in stopWords }
+            .filter { it.length >= 2 && it !in stopWords }
 
         if (allCues.isNotEmpty() && keywords.isNotEmpty()) {
-            val windows = allCues.chunked(3)
+            val windows = allCues.chunked(4)
             val scored = windows.map { chunk ->
                 val textCombined = chunk.joinToString(" ") { it.text }
                 val textLower = textCombined.lowercase()
                 val keywordHits = keywords.count { kw -> textLower.contains(kw) }
-                val timeProximityBonus = if (abs(chunk.first().startSec - currentSec) <= 120) 0.5 else 0.0
-                Triple(chunk.first().startSec, textCombined, keywordHits + timeProximityBonus)
+                val timeBonus = if (abs(chunk.first().startSec - currentSec) <= 120) 0.4 else 0.0
+                Triple(chunk.first().startSec, textCombined, keywordHits + timeBonus)
             }.sortedByDescending { it.third }
 
             val bestMatches = scored.filter { it.third >= 1.0 }.take(3)
@@ -561,27 +588,416 @@ private class LocalAiPanelView(
             }
         }
 
-        return if (allCues.isNotEmpty()) {
-            val nearCurrent = allCues.filter { abs(it.startSec - currentSec) <= 75 }.ifEmpty { allCues.take(6) }
-            "From the transcript:\n\"${nearCurrent.take(8).joinToString(" ") { it.text }}\""
+        return when {
+            allCues.isNotEmpty() -> {
+                val nearCurrent = allCues.filter { abs(it.startSec - currentSec) <= 75 }.ifEmpty { allCues.take(8) }
+                "From the transcript near [${formatSec(currentSec)}]:\n\"${nearCurrent.take(10).joinToString(" ") { it.text }}\""
+            }
+            meta.description.isNotBlank() -> {
+                "From the video description:\n${meta.description.take(500)}"
+            }
+            else -> {
+                "Video: \"${meta.title}\" by ${meta.author}. (No closed captions were returned by YouTube for this video.)"
+            }
+        }
+    }
+
+    /**
+     * Multi-layered YouTube metadata & caption fetcher:
+     * 1. Innertube ANDROID_VR, IOS, and ANDROID 20.x clients
+     * 2. Watch page HTML bracket-balanced extractor for `captionTracks` and `shortDescription`
+     * 3. Piped public API fallback
+     * 4. Universal parser supporting json3, srv3 (<p t="...">), srv1 (<text start="...">), and vtt
+     */
+    private fun fetchYouTubeContext(vid: String): VideoMetadata {
+        var title = ""
+        var author = ""
+        var description = ""
+        val captionCandidates = mutableListOf<Pair<String, String>>() // (url, userAgent)
+
+        data class ClientSpec(val name: String, val version: String, val ua: String, val extraJson: String = "")
+
+        val clients = listOf(
+            ClientSpec(
+                name = "ANDROID_VR",
+                version = "1.60.19",
+                ua = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1)",
+                extraJson = """"deviceMake":"Oculus","deviceModel":"Quest 3","androidSdkVersion":32,"osName":"Android","osVersion":"12","""
+            ),
+            ClientSpec(
+                name = "IOS",
+                version = "20.10.4",
+                ua = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_1 like Mac OS X; en_US)",
+                extraJson = """"deviceMake":"Apple","deviceModel":"iPhone16,2","osName":"iPhone","osVersion":"18.3.1.22D72","""
+            ),
+            ClientSpec(
+                name = "ANDROID",
+                version = "20.10.38",
+                ua = "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US)",
+                extraJson = """"androidSdkVersion":34,"osName":"Android","osVersion":"14","""
+            )
+        )
+
+        // 1. Try Innertube clients
+        for (client in clients) {
+            if (captionCandidates.isNotEmpty() && title.isNotBlank() && description.isNotBlank()) break
+            try {
+                val payload = """
+                    {
+                      "context": {
+                        "client": {
+                          "clientName": "${client.name}",
+                          "clientVersion": "${client.version}",
+                          ${client.extraJson}
+                          "hl": "en",
+                          "gl": "US"
+                        }
+                      },
+                      "videoId": "$vid"
+                    }
+                """.trimIndent()
+
+                val responseStr = httpPostJson(
+                    urlStr = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                    jsonBody = payload,
+                    userAgent = client.ua
+                ) ?: continue
+
+                val json = JSONObject(responseStr)
+                json.optJSONObject("videoDetails")?.let { details ->
+                    if (title.isBlank()) title = details.optString("title", "")
+                    if (author.isBlank()) author = details.optString("author", "")
+                    if (description.isBlank()) description = details.optString("shortDescription", "")
+                }
+
+                val tracks = json.optJSONObject("captions")
+                    ?.optJSONObject("playerCaptionsTracklistRenderer")
+                    ?.optJSONArray("captionTracks")
+
+                val bestUrl = pickBestCaptionUrl(tracks)
+                if (bestUrl != null) {
+                    captionCandidates.add(bestUrl to client.ua)
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 2. Try Watch Page HTML extraction with balanced JSON array matching
+        if (captionCandidates.isEmpty() || description.isBlank()) {
+            try {
+                val desktopUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                val html = httpGet(
+                    urlStr = "https://www.youtube.com/watch?v=$vid&hl=en",
+                    userAgent = desktopUa
+                )
+                if (!html.isNullOrBlank()) {
+                    if (title.isBlank()) {
+                        Regex(""""title":\s*"((?:[^"\\]|\\.)*)"""").find(html)?.let {
+                            title = unescapeJsonString(it.groupValues[1])
+                        }
+                    }
+                    if (description.isBlank()) {
+                        Regex(""""shortDescription":\s*"((?:[^"\\]|\\.)*)"""").find(html)?.let {
+                            description = unescapeJsonString(it.groupValues[1])
+                        }
+                    }
+                    val tracksJsonArr = extractJsonArrayAfterKey(html, "\"captionTracks\":")
+                    if (tracksJsonArr != null) {
+                        val bestUrl = pickBestCaptionUrl(JSONArray(tracksJsonArr))
+                        if (bestUrl != null) {
+                            captionCandidates.add(bestUrl to desktopUa)
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // 3. Parse captions from candidate URLs
+        var parsedCues = emptyList<TranscriptCue>()
+        for ((rawUrl, ua) in captionCandidates) {
+            parsedCues = downloadAndParseCaptions(rawUrl, ua)
+            if (parsedCues.isNotEmpty()) break
+        }
+
+        // 4. Fallback: Piped API if YouTube throttled direct timedtext requests
+        if (parsedCues.isEmpty() || description.isBlank()) {
+            val pipedHosts = listOf(
+                "https://pipedapi.kavin.rocks",
+                "https://api.piped.private.coffee"
+            )
+            for (host in pipedHosts) {
+                if (parsedCues.isNotEmpty() && description.isNotBlank()) break
+                try {
+                    val streamJson = httpGet("$host/streams/$vid", "Mozilla/5.0") ?: continue
+                    val obj = JSONObject(streamJson)
+                    if (title.isBlank()) title = obj.optString("title", "")
+                    if (author.isBlank()) author = obj.optString("uploader", "")
+                    if (description.isBlank()) description = obj.optString("description", "")
+
+                    if (parsedCues.isEmpty()) {
+                        val subs = obj.optJSONArray("subtitles")
+                        if (subs != null && subs.length() > 0) {
+                            var subUrl = subs.getJSONObject(0).optString("url")
+                            for (i in 0 until subs.length()) {
+                                val s = subs.getJSONObject(i)
+                                if (s.optString("code").startsWith("en")) {
+                                    subUrl = s.optString("url")
+                                    break
+                                }
+                            }
+                            if (subUrl.isNotBlank()) {
+                                parsedCues = downloadAndParseCaptions(subUrl, "Mozilla/5.0")
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
+        // 5. Final fallback for title/author via noembed
+        if (title.isBlank()) {
+            try {
+                val noembed = httpGet("https://noembed.com/embed?url=https://www.youtube.com/watch?v=$vid", "Mozilla/5.0")
+                if (noembed != null) {
+                    val obj = JSONObject(noembed)
+                    title = obj.optString("title", "")
+                    author = obj.optString("author_name", "")
+                }
+            } catch (_: Exception) {}
+        }
+
+        return VideoMetadata(
+            videoId = vid,
+            title = title,
+            author = author,
+            description = description,
+            cues = parsedCues
+        )
+    }
+
+    private fun pickBestCaptionUrl(tracks: JSONArray?): String? {
+        if (tracks == null || tracks.length() == 0) return null
+        var selected = tracks.getJSONObject(0)
+        for (i in 0 until tracks.length()) {
+            val t = tracks.getJSONObject(i)
+            val lang = t.optString("languageCode", "")
+            val kind = t.optString("kind", "")
+            if (lang.startsWith("en") && kind != "asr") {
+                selected = t
+                break
+            } else if (lang.startsWith("en")) {
+                selected = t
+            }
+        }
+        return selected.optString("baseUrl").takeIf { it.isNotBlank() }
+    }
+
+    private fun downloadAndParseCaptions(baseUrl: String, userAgent: String): List<TranscriptCue> {
+        // Attempt 1: Force fmt=json3 (replacing any existing fmt=srv3/srv1)
+        val json3Url = if (baseUrl.contains("fmt=")) {
+            baseUrl.replace(Regex("fmt=[^&]+"), "fmt=json3")
         } else {
-            "From the video description:\n${meta.description.take(400)}"
+            "$baseUrl&fmt=json3"
+        }
+
+        val attempts = listOf(json3Url, baseUrl).distinct()
+        for (url in attempts) {
+            val raw = httpGet(url, userAgent) ?: continue
+            val parsed = parseCaptionPayload(raw)
+            if (parsed.isNotEmpty()) return parsed
+        }
+        return emptyList()
+    }
+
+    /**
+     * Parses JSON3, SRV3 (<p t="ms">), SRV1 (<text start="sec">), and WebVTT caption formats.
+     */
+    private fun parseCaptionPayload(payload: String): List<TranscriptCue> {
+        val trimmed = payload.trimStart()
+        if (trimmed.isEmpty()) return emptyList()
+        val cues = mutableListOf<TranscriptCue>()
+
+        // Format A: JSON3
+        if (trimmed.startsWith("{")) {
+            try {
+                val events = JSONObject(trimmed).optJSONArray("events") ?: JSONArray()
+                for (i in 0 until events.length()) {
+                    val ev = events.getJSONObject(i)
+                    val startMs = ev.optLong("tStartMs", 0L)
+                    val segs = ev.optJSONArray("segs") ?: continue
+                    val sb = StringBuilder()
+                    for (j in 0 until segs.length()) {
+                        sb.append(segs.getJSONObject(j).optString("utf8", ""))
+                    }
+                    val clean = sb.toString().replace("\n", " ").replace(Regex("\\s+"), " ").trim()
+                    if (clean.isNotEmpty()) {
+                        cues.add(TranscriptCue((startMs / 1000L).toInt(), clean))
+                    }
+                }
+                if (cues.isNotEmpty()) return cues
+            } catch (_: Exception) {}
+        }
+
+        // Format B: SRV3 XML (<p t="12340" d="3000"><s>word</s>...</p>)
+        val srv3Regex = Regex("""<p\s+[^>]*\bt="(\d+)"[^>]*>(.*?)</p>""", RegexOption.DOT_MATCHES_ALL)
+        for (match in srv3Regex.findAll(trimmed)) {
+            val startMs = match.groupValues[1].toLongOrNull() ?: 0L
+            val innerHtml = match.groupValues[2].replace(Regex("<[^>]+>"), "")
+            val decoded = Html.fromHtml(innerHtml, Html.FROM_HTML_MODE_LEGACY).toString()
+                .replace("\n", " ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            if (decoded.isNotEmpty()) {
+                cues.add(TranscriptCue((startMs / 1000L).toInt(), decoded))
+            }
+        }
+        if (cues.isNotEmpty()) return cues
+
+        // Format C: SRV1 XML (<text start="12.34" dur="3.2">...</text>)
+        val srv1Regex = Regex("""<text\s+[^>]*\bstart="([\d.]+)"[^>]*>(.*?)</text>""", RegexOption.DOT_MATCHES_ALL)
+        for (match in srv1Regex.findAll(trimmed)) {
+            val startSec = match.groupValues[1].toDoubleOrNull()?.toInt() ?: 0
+            val innerHtml = match.groupValues[2].replace(Regex("<[^>]+>"), "")
+            val decoded = Html.fromHtml(innerHtml, Html.FROM_HTML_MODE_LEGACY).toString()
+                .replace("\n", " ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            if (decoded.isNotEmpty()) {
+                cues.add(TranscriptCue(startSec, decoded))
+            }
+        }
+        if (cues.isNotEmpty()) return cues
+
+        // Format D: WebVTT
+        if (trimmed.startsWith("WEBVTT")) {
+            val lines = trimmed.lines()
+            val timeRegex = Regex("""(?:(\d+):)?(\d{2}):(\d{2})[.,]\d+\s*-->""")
+            var currentSec = -1
+            val textBuf = StringBuilder()
+            for (line in lines) {
+                val m = timeRegex.find(line)
+                if (m != null) {
+                    if (currentSec >= 0 && textBuf.isNotEmpty()) {
+                        cues.add(TranscriptCue(currentSec, textBuf.toString().trim()))
+                    }
+                    textBuf.clear()
+                    val hrs = m.groupValues[1].toIntOrNull() ?: 0
+                    val mins = m.groupValues[2].toIntOrNull() ?: 0
+                    val secs = m.groupValues[3].toIntOrNull() ?: 0
+                    currentSec = hrs * 3600 + mins * 60 + secs
+                } else if (currentSec >= 0 && line.isNotBlank() && !line.startsWith("NOTE")) {
+                    val cleanLine = line.replace(Regex("<[^>]+>"), "").trim()
+                    if (cleanLine.isNotEmpty()) {
+                        if (textBuf.isNotEmpty()) textBuf.append(" ")
+                        textBuf.append(cleanLine)
+                    }
+                }
+            }
+            if (currentSec >= 0 && textBuf.isNotEmpty()) {
+                cues.add(TranscriptCue(currentSec, textBuf.toString().trim()))
+            }
+        }
+
+        return cues
+    }
+
+    private fun extractJsonArrayAfterKey(source: String, key: String): String? {
+        val keyIdx = source.indexOf(key)
+        if (keyIdx == -1) return null
+        val startBracket = source.indexOf('[', keyIdx + key.length)
+        if (startBracket == -1) return null
+
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (i in startBracket until source.length) {
+            val c = source[i]
+            if (escaped) {
+                escaped = false
+                continue
+            }
+            if (c == '\\') {
+                escaped = true
+                continue
+            }
+            if (c == '"') {
+                inString = !inString
+                continue
+            }
+            if (!inString) {
+                if (c == '[') depth++
+                else if (c == ']') {
+                    depth--
+                    if (depth == 0) {
+                        return source.substring(startBracket, i + 1)
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun unescapeJsonString(raw: String): String {
+        return try {
+            JSONObject("""{"v":"$raw"}""").optString("v", raw)
+        } catch (_: Exception) {
+            raw.replace("\\n", "\n").replace("\\\"", "\"")
+        }
+    }
+
+    private fun httpGet(urlStr: String, userAgent: String): String? {
+        return try {
+            val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 8000
+                readTimeout = 8000
+                setRequestProperty("User-Agent", userAgent)
+                setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                setRequestProperty("Cookie", "CONSENT=YES+cb.20210328-17-p0.en+FX+999")
+            }
+            if (conn.responseCode in 200..299) {
+                val stream = if ("gzip".equals(conn.contentEncoding, ignoreCase = true)) {
+                    GZIPInputStream(conn.inputStream)
+                } else {
+                    conn.inputStream
+                }
+                BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+            } else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun httpPostJson(urlStr: String, jsonBody: String, userAgent: String): String? {
+        return try {
+            val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                connectTimeout = 8000
+                readTimeout = 8000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("User-Agent", userAgent)
+                setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+            }
+            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(jsonBody) }
+            if (conn.responseCode in 200..299) {
+                val stream = if ("gzip".equals(conn.contentEncoding, ignoreCase = true)) {
+                    GZIPInputStream(conn.inputStream)
+                } else {
+                    conn.inputStream
+                }
+                BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+            } else null
+        } catch (_: Exception) {
+            null
         }
     }
 
     private fun checkLocalOllamaModel(): String? {
         return try {
-            val conn = (URL("http://127.0.0.1:11434/api/tags").openConnection() as HttpURLConnection).apply {
-                connectTimeout = 1200
-                readTimeout = 1500
-                requestMethod = "GET"
-            }
-            if (conn.responseCode == 200) {
-                val body = conn.inputStream.bufferedReader().use { it.readText() }
-                val models = JSONObject(body).optJSONArray("models")
-                if (models != null && models.length() > 0) {
-                    models.getJSONObject(0).optString("name").takeIf { it.isNotBlank() }
-                } else null
+            val body = httpGet("http://127.0.0.1:11434/api/tags", "HackerTubeLite") ?: return null
+            val models = JSONObject(body).optJSONArray("models")
+            if (models != null && models.length() > 0) {
+                models.getJSONObject(0).optString("name").takeIf { it.isNotBlank() }
             } else null
         } catch (_: Exception) {
             null
@@ -590,23 +1006,14 @@ private class LocalAiPanelView(
 
     private fun queryLocalOllama(model: String, prompt: String): String? {
         return try {
-            val conn = (URL("http://127.0.0.1:11434/api/generate").openConnection() as HttpURLConnection).apply {
-                connectTimeout = 5000
-                readTimeout = 60000
-                requestMethod = "POST"
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-            }
             val payload = JSONObject().apply {
                 put("model", model)
                 put("prompt", prompt)
                 put("stream", false)
             }
-            OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()) }
-            if (conn.responseCode == 200) {
-                val resp = conn.inputStream.bufferedReader().use { it.readText() }
-                JSONObject(resp).optString("response").trim().takeIf { it.isNotEmpty() }
-            } else null
+            val resp = httpPostJson("http://127.0.0.1:11434/api/generate", payload.toString(), "HackerTubeLite")
+                ?: return null
+            JSONObject(resp).optString("response").trim().takeIf { it.isNotEmpty() }
         } catch (_: Exception) {
             null
         }
@@ -656,119 +1063,6 @@ private class LocalAiPanelView(
         } catch (_: Throwable) {
             null
         }
-    }
-
-    private fun fetchYouTubeContext(vid: String): VideoMetadata {
-        var title = ""
-        var author = ""
-        var description = ""
-        var captionUrl: String? = null
-
-        try {
-            val conn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false").openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 8000
-                readTimeout = 8000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("User-Agent", "com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip")
-            }
-            val body = """
-                {
-                  "context": {
-                    "client": {
-                      "clientName": "ANDROID",
-                      "clientVersion": "19.29.37",
-                      "androidSdkVersion": 34,
-                      "hl": "en",
-                      "gl": "US"
-                    }
-                  },
-                  "videoId": "$vid"
-                }
-            """.trimIndent()
-            OutputStreamWriter(conn.outputStream).use { it.write(body) }
-
-            if (conn.responseCode == 200) {
-                val responseStr = BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
-                val json = JSONObject(responseStr)
-
-                json.optJSONObject("videoDetails")?.let { details ->
-                    title = details.optString("title", title)
-                    author = details.optString("author", author)
-                    description = details.optString("shortDescription", description)
-                }
-
-                val tracks = json.optJSONObject("captions")
-                    ?.optJSONObject("playerCaptionsTracklistRenderer")
-                    ?.optJSONArray("captionTracks")
-
-                if (tracks != null && tracks.length() > 0) {
-                    var selectedTrack = tracks.getJSONObject(0)
-                    for (i in 0 until tracks.length()) {
-                        val t = tracks.getJSONObject(i)
-                        if (t.optString("languageCode").startsWith("en")) {
-                            selectedTrack = t
-                            break
-                        }
-                    }
-                    captionUrl = selectedTrack.optString("baseUrl").takeIf { it.isNotBlank() }
-                }
-            }
-        } catch (_: Exception) {}
-
-        if (title.isBlank()) {
-            try {
-                val noembed = URL("https://noembed.com/embed?url=https://www.youtube.com/watch?v=$vid").readText()
-                val obj = JSONObject(noembed)
-                title = obj.optString("title", "")
-                author = obj.optString("author_name", "")
-            } catch (_: Exception) {}
-        }
-
-        val cues = mutableListOf<TranscriptCue>()
-        if (captionUrl != null) {
-            try {
-                val json3Url = if (captionUrl.contains("fmt=")) captionUrl else "$captionUrl&fmt=json3"
-                val capText = URL(json3Url).readText()
-                if (capText.trimStart().startsWith("{")) {
-                    val events = JSONObject(capText).optJSONArray("events") ?: JSONArray()
-                    for (i in 0 until events.length()) {
-                        val ev = events.getJSONObject(i)
-                        val startMs = ev.optLong("tStartMs", 0L)
-                        val segs = ev.optJSONArray("segs") ?: continue
-                        val lineBuilder = StringBuilder()
-                        for (j in 0 until segs.length()) {
-                            lineBuilder.append(segs.getJSONObject(j).optString("utf8", ""))
-                        }
-                        val clean = lineBuilder.toString().replace("\n", " ").trim()
-                        if (clean.isNotEmpty()) {
-                            cues.add(TranscriptCue((startMs / 1000L).toInt(), clean))
-                        }
-                    }
-                } else {
-                    val regex = Regex("""<text start="([\d.]+)"[^>]*>(.*?)</text>""", RegexOption.DOT_MATCHES_ALL)
-                    for (match in regex.findAll(capText)) {
-                        val sec = match.groupValues[1].toDoubleOrNull()?.toInt() ?: 0
-                        val rawTxt = match.groupValues[2]
-                        val decoded = Html.fromHtml(rawTxt, Html.FROM_HTML_MODE_LEGACY).toString()
-                            .replace("\n", " ")
-                            .trim()
-                        if (decoded.isNotEmpty()) {
-                            cues.add(TranscriptCue(sec, decoded))
-                        }
-                    }
-                }
-            } catch (_: Exception) {}
-        }
-
-        return VideoMetadata(
-            videoId = vid,
-            title = title,
-            author = author,
-            description = description,
-            cues = cues
-        )
     }
 
     private fun formatSec(totalSec: Int): String {
