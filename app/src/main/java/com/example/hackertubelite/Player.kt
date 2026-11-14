@@ -16,8 +16,10 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -29,6 +31,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.key
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import org.json.JSONArray
@@ -39,7 +42,12 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.GZIPInputStream
 import kotlin.math.abs
 
@@ -53,13 +61,21 @@ val LocalFullscreen = compositionLocalOf<FullscreenController?> { null }
 
 private data class TranscriptCue(val startSec: Int, val text: String)
 
+private data class TranscriptPassage(val startSec: Int, val endSec: Int, val text: String)
+
 private data class VideoMetadata(
     val videoId: String,
     val title: String = "",
     val author: String = "",
     val description: String = "",
-    val cues: List<TranscriptCue> = emptyList()
+    val cues: List<TranscriptCue> = emptyList(),
+    val passages: List<TranscriptPassage> = emptyList()
 )
+
+private class SharedPlayerClock {
+    val currentSec = AtomicInteger(0)
+    val isLiveSynced = AtomicBoolean(false)
+}
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -67,8 +83,10 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
     val fullscreen = LocalFullscreen.current
 
     key(videoId) {
+        val sharedClock = remember(videoId) { SharedPlayerClock() }
+
         Column(modifier = Modifier.fillMaxWidth()) {
-            // 1. TOP: Working 16:9 YouTube WebView (untouched)
+            // 1. TOP: Your working 16:9 YouTube WebView + non-intrusive JS time bridge
             AndroidView(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -78,6 +96,16 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         settings.mediaPlaybackRequiresUserGesture = false
+
+                        addJavascriptInterface(object {
+                            @JavascriptInterface
+                            fun onTime(seconds: Double) {
+                                if (!seconds.isNaN() && seconds >= 0.0) {
+                                    sharedClock.currentSec.set(seconds.toInt())
+                                    sharedClock.isLiveSynced.set(true)
+                                }
+                            }
+                        }, "AndroidPlayerBridge")
 
                         webChromeClient = object : WebChromeClient() {
                             override fun onShowCustomView(view: View, callback: WebChromeClient.CustomViewCallback) {
@@ -96,8 +124,28 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
                             "p{margin:0;padding:12px;text-align:center;color:#888;font:14px sans-serif}" +
                             "iframe{position:absolute;left:0;top:0;width:100vw;height:56.25vw;border:0}</style>" +
                             "</head><body><p>Loading player...</p>" +
-                            "<iframe src='https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&playsinline=1&rel=0' " +
+                            "<iframe id='ytplayer' src='https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&playsinline=1&rel=0&enablejsapi=1&origin=https://www.youtube-nocookie.com' " +
                             "allow='autoplay; encrypted-media; fullscreen' allowfullscreen></iframe>" +
+                            "<script>" +
+                            "(function(){" +
+                            "var f=document.getElementById('ytplayer');" +
+                            "function sub(){" +
+                            "try{" +
+                            "f.contentWindow.postMessage(JSON.stringify({event:'listening',id:1,channel:'widget'}),'*');" +
+                            "f.contentWindow.postMessage(JSON.stringify({event:'command',func:'addEventListener',args:['onStateChange'],id:1,channel:'widget'}),'*');" +
+                            "}catch(e){}" +
+                            "}" +
+                            "f.addEventListener('load',function(){sub();setInterval(sub,1500);});" +
+                            "window.addEventListener('message',function(e){" +
+                            "try{" +
+                            "var d=typeof e.data==='string'?JSON.parse(e.data):e.data;" +
+                            "if(d&&d.info&&typeof d.info.currentTime==='number'){" +
+                            "AndroidPlayerBridge.onTime(d.info.currentTime);" +
+                            "}" +
+                            "}catch(err){}" +
+                            "});" +
+                            "})();" +
+                            "</script>" +
                             "</body></html>"
                         loadDataWithBaseURL("https://www.youtube-nocookie.com", html, "text/html", "utf-8", null)
                     }
@@ -108,11 +156,11 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
                 },
             )
 
-            // 2. BOTTOM: Local AI Video Q&A Section
+            // 2. BOTTOM: Local AI Video Q&A Section synced with live video clock
             AndroidView(
                 modifier = Modifier.fillMaxWidth(),
                 factory = { ctx ->
-                    LocalAiPanelView(ctx, videoId)
+                    LocalAiPanelView(ctx, videoId, sharedClock)
                 },
                 onRelease = {
                     it.cleanup()
@@ -122,23 +170,36 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
     }
 }
 
-@SuppressLint("ViewConstructor", "ClickableViewAccessibility")
+@SuppressLint("ViewConstructor", "ClickableViewAccessibility", "SetJavaScriptEnabled")
 private class LocalAiPanelView(
     context: Context,
-    private val videoId: String
+    private val videoId: String,
+    private val playerClock: SharedPlayerClock
 ) : LinearLayout(context) {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val executor = Executors.newCachedThreadPool()
-    private val openedAtMs = System.currentTimeMillis()
     private val fetchLock = Any()
 
-    private val statusText: TextView
+    private val timeBadge: TextView
     private val engineBadge: TextView
+    private val statusText: TextView
     private val chatContainer: LinearLayout
     private val chatScroll: ScrollView
     private val questionInput: EditText
     private val askButton: TextView
+
+    // Hidden WebView that runs local On-Device Neural AI (LaMini-Flan-T5 via WebAssembly)
+    private var wasmAiWebView: WebView? = null
+
+    @Volatile
+    private var isWasmAiReady = false
+
+    @Volatile
+    private var isWasmAiLoading = false
+
+    private var activeWasmLatch: CountDownLatch? = null
+    private val latestWasmResult = AtomicReference<String?>(null)
 
     @Volatile
     private var videoMeta = VideoMetadata(videoId = videoId)
@@ -152,6 +213,16 @@ private class LocalAiPanelView(
     @Volatile
     private var ollamaModelName: String? = null
 
+    private val clockTicker = object : Runnable {
+        override fun run() {
+            val sec = playerClock.currentSec.get()
+            val synced = playerClock.isLiveSynced.get()
+            timeBadge.text = if (synced) "⏱️ ${formatSec(sec)}" else "⏱️ ${formatSec(sec)}"
+            timeBadge.setTextColor(if (synced) Color.parseColor("#00E676") else Color.parseColor("#B0BEC5"))
+            mainHandler.postDelayed(this, 1000L)
+        }
+    }
+
     init {
         orientation = VERTICAL
         setPadding(dp(12), dp(10), dp(12), dp(12))
@@ -161,7 +232,7 @@ private class LocalAiPanelView(
             ViewGroup.LayoutParams.WRAP_CONTENT
         )
 
-        // Header Row
+        // Header Row (Title + Live Video Time + Engine Badge)
         val headerRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -176,27 +247,45 @@ private class LocalAiPanelView(
             layoutParams = LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
+        timeBadge = TextView(context).apply {
+            text = "⏱️ 00:00"
+            setTextColor(Color.parseColor("#B0BEC5"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            background = roundedBg("#1A2621", dp(12), strokeColor = "#2E4C3E")
+            val lp = LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.marginEnd = dp(6)
+            layoutParams = lp
+        }
+
         engineBadge = TextView(context).apply {
-            text = "Checking Local AI..."
+            text = "⚡ Starting Local AI..."
             setTextColor(Color.parseColor("#B0BEC5"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setPadding(dp(8), dp(4), dp(8), dp(4))
             background = roundedBg("#1E272C", dp(12))
-            setOnClickListener { detectLocalAiBackends(showToastInChat = true) }
+            setOnClickListener {
+                if (!isWasmAiReady && !isWasmAiLoading) {
+                    initOnDeviceWasmLlm()
+                } else {
+                    detectLocalAiBackends(showToastInChat = true)
+                }
+            }
         }
 
         headerRow.addView(headerTitle)
+        headerRow.addView(timeBadge)
         headerRow.addView(engineBadge)
         addView(headerRow)
 
-        // Transcript & Video Status (tap to retry if needed)
+        // Transcript & Video Status
         statusText = TextView(context).apply {
             text = "⏳ Loading video transcript & captions..."
             setTextColor(Color.parseColor("#9E9E9E"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, dp(4), 0, dp(8))
             setOnClickListener {
-                text = "🔄 Retrying transcript download..."
+                text = "🔄 Reloading transcript..."
                 loadVideoMetadataAndTranscript(forceRetry = true)
             }
         }
@@ -213,10 +302,10 @@ private class LocalAiPanelView(
         }
 
         val quickPrompts = listOf(
-            "⚡ Summarize Video" to "Summarize what this video is about in 3-4 bullet points.",
-            "🎯 Explain Current Part" to "Explain what is being discussed around my current playback time.",
-            "📌 Key Takeaways" to "What are the main takeaways or important points in this video?",
-            "📜 Show Transcript" to "__SHOW_TRANSCRIPT__"
+            "🎯 Explain Current Part" to "What is the speaker explaining right now at this moment in the video?",
+            "⚡ Summarize Video" to "Summarize the main topic and core progression of this video.",
+            "📌 Key Takeaways" to "What are the key takeaways and main lessons from this talk?",
+            "📜 Live Transcript" to "__SHOW_TRANSCRIPT__"
         )
 
         for ((label, promptText) in quickPrompts) {
@@ -244,7 +333,7 @@ private class LocalAiPanelView(
 
         // Chat Messages Scroll Area
         chatScroll = ScrollView(context).apply {
-            layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(190))
+            layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(200))
             background = roundedBg("#181818", dp(10), strokeColor = "#2A2A2A")
             setPadding(dp(10), dp(10), dp(10), dp(10))
             setOnTouchListener { v, event ->
@@ -272,7 +361,7 @@ private class LocalAiPanelView(
         }
 
         questionInput = EditText(context).apply {
-            hint = "Ask about this video..."
+            hint = "Ask anything about this video..."
             setHintTextColor(Color.parseColor("#757575"))
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -321,15 +410,148 @@ private class LocalAiPanelView(
 
         appendChatBubble(
             sender = "AI",
-            message = "Ask me anything about this video! Tap a chip above or type a question below."
+            message = "Synced with video player! Ask any question about the talk or tap '🎯 Explain Current Part' as you watch."
         )
 
+        mainHandler.post(clockTicker)
         loadVideoMetadataAndTranscript(forceRetry = false)
         detectLocalAiBackends(showToastInChat = false)
+        initOnDeviceWasmLlm()
     }
 
-    private fun estimatedPlaybackSec(): Int {
-        return ((System.currentTimeMillis() - openedAtMs) / 1000L).toInt().coerceAtLeast(0)
+    /**
+     * Initializes an embedded On-Device Neural Model (LaMini-Flan-T5-77M via Transformers.js WASM)
+     * inside a 1x1 hidden WebView so the phone runs true neural text2text Q&A with zero Gradle setup.
+     */
+    private fun initOnDeviceWasmLlm() {
+        if (isWasmAiReady || isWasmAiLoading) return
+        isWasmAiLoading = true
+
+        mainHandler.post {
+            try {
+                val wv = WebView(context).apply {
+                    layoutParams = LayoutParams(1, 1)
+                    visibility = View.GONE
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    settings.databaseEnabled = true
+                    settings.allowFileAccess = true
+
+                    addJavascriptInterface(object {
+                        @JavascriptInterface
+                        fun onProgress(status: String) {
+                            mainHandler.post {
+                                if (ollamaModelName == null && mediaPipeLlmInstance == null && !isWasmAiReady) {
+                                    engineBadge.text = status
+                                }
+                            }
+                        }
+
+                        @JavascriptInterface
+                        fun onReady() {
+                            isWasmAiReady = true
+                            isWasmAiLoading = false
+                            mainHandler.post {
+                                if (ollamaModelName == null && mediaPipeLlmInstance == null) {
+                                    engineBadge.text = "🟢 Local Neural AI"
+                                    engineBadge.setTextColor(Color.parseColor("#00E676"))
+                                }
+                            }
+                        }
+
+                        @JavascriptInterface
+                        fun onError(err: String) {
+                            isWasmAiLoading = false
+                            mainHandler.post {
+                                if (ollamaModelName == null && mediaPipeLlmInstance == null) {
+                                    engineBadge.text = "⚡ Smart Transcript AI"
+                                }
+                            }
+                        }
+
+                        @JavascriptInterface
+                        fun onAnswer(text: String) {
+                            latestWasmResult.set(text.trim())
+                            activeWasmLatch?.countDown()
+                        }
+                    }, "LocalNeuralBridge")
+
+                    webViewClient = WebViewClient()
+
+                    val aiHtml = """
+                        <!DOCTYPE html>
+                        <html><head><meta charset="utf-8"></head><body>
+                        <script type="module">
+                        import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+                        env.allowLocalModels = false;
+                        env.useBrowserCache = true;
+
+                        let generator = null;
+
+                        async function boot() {
+                            try {
+                                LocalNeuralBridge.onProgress("⏳ Loading Neural AI...");
+                                generator = await pipeline('text2text-generation', 'Xenova/LaMini-Flan-T5-77M', {
+                                    progress_callback: (p) => {
+                                        if (p && p.status === 'progress' && typeof p.progress === 'number') {
+                                            LocalNeuralBridge.onProgress("📥 AI Model " + Math.round(p.progress) + "%");
+                                        }
+                                    }
+                                });
+                                LocalNeuralBridge.onReady();
+                            } catch (e) {
+                                LocalNeuralBridge.onError(String(e));
+                            }
+                        }
+
+                        window.runLocalInference = async function(promptText) {
+                            if (!generator) {
+                                LocalNeuralBridge.onAnswer("");
+                                return;
+                            }
+                            try {
+                                const out = await generator(promptText, {
+                                    max_new_tokens: 160,
+                                    temperature: 0.3,
+                                    repetition_penalty: 1.2
+                                });
+                                const ans = (out && out[0] && out[0].generated_text) ? out[0].generated_text : "";
+                                LocalNeuralBridge.onAnswer(ans);
+                            } catch (err) {
+                                LocalNeuralBridge.onAnswer("");
+                            }
+                        };
+
+                        boot();
+                        </script>
+                        </body></html>
+                    """.trimIndent()
+
+                    loadDataWithBaseURL("https://huggingface.co", aiHtml, "text/html", "utf-8", null)
+                }
+                wasmAiWebView = wv
+                addView(wv)
+            } catch (_: Throwable) {
+                isWasmAiLoading = false
+            }
+        }
+    }
+
+    private fun queryWasmNeuralLlm(prompt: String): String? {
+        if (!isWasmAiReady || wasmAiWebView == null) return null
+        return try {
+            val latch = CountDownLatch(1)
+            activeWasmLatch = latch
+            latestWasmResult.set(null)
+            val escapedPrompt = JSONObject.quote(prompt)
+            mainHandler.post {
+                wasmAiWebView?.evaluateJavascript("window.runLocalInference($escapedPrompt);", null)
+            }
+            latch.await(25, TimeUnit.SECONDS)
+            latestWasmResult.get()?.takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun loadVideoMetadataAndTranscript(forceRetry: Boolean) {
@@ -358,8 +580,8 @@ private class LocalAiPanelView(
         val titleDisplay = if (meta.title.isNotBlank()) meta.title else "Video $videoId"
         val cueCount = meta.cues.size
         statusText.text = when {
-            cueCount > 0 -> "📺 $titleDisplay\n✅ $cueCount caption lines loaded for Q&A"
-            meta.description.isNotBlank() -> "📺 $titleDisplay\nℹ️ Captions unavailable; description loaded (${meta.description.length} chars) — tap to retry"
+            cueCount > 0 -> "📺 $titleDisplay\n✅ $cueCount caption lines synced (${meta.passages.size} topic segments)"
+            meta.description.isNotBlank() -> "📺 $titleDisplay\nℹ️ Using video description (${meta.description.length} chars) — tap to retry captions"
             else -> "📺 $titleDisplay\n⚠️ Captions didn't load — tap here to retry"
         }
     }
@@ -385,9 +607,9 @@ private class LocalAiPanelView(
                     if (loaded != null) {
                         mediaPipeLlmInstance = loaded
                         mainHandler.post {
-                            engineBadge.text = "🟢 On-Device: ${modelFile.name.take(14)}"
+                            engineBadge.text = "🟢 On-Device: ${modelFile.name.take(12)}"
                             if (showToastInChat) {
-                                appendChatBubble("System", "Loaded on-device model: ${modelFile.name}")
+                                appendChatBubble("System", "Loaded MediaPipe model: ${modelFile.name}")
                             }
                         }
                         return@execute
@@ -398,90 +620,280 @@ private class LocalAiPanelView(
             }
 
             mainHandler.post {
-                engineBadge.text = "⚡ Built-in Transcript AI"
-                if (showToastInChat) {
-                    appendChatBubble(
-                        "System",
-                        "Running Built-in Offline Transcript AI.\n" +
-                            "• For local Ollama: run `ollama serve` in Termux and tap this badge.\n" +
-                            "• For MediaPipe LLM: place a `.task` or `.bin` model in Downloads."
-                    )
+                if (isWasmAiReady) {
+                    engineBadge.text = "🟢 Local Neural AI"
+                    if (showToastInChat) {
+                        appendChatBubble("System", "On-Device Neural AI (LaMini-Flan-T5) is active and answering from the video transcript.")
+                    }
+                } else {
+                    if (!isWasmAiLoading) engineBadge.text = "⚡ Smart Transcript AI"
+                    if (showToastInChat) {
+                        appendChatBubble(
+                            "System",
+                            "AI Status:\n" +
+                                "• On-Device Neural Model: ${if (isWasmAiLoading) "Downloading/Loading in background..." else "Ready"}\n" +
+                                "• Live Video Clock: ${if (playerClock.isLiveSynced.get()) "Synced with YouTube player" else "Waiting for playback"}"
+                        )
+                    }
                 }
             }
         }
     }
 
     private fun submitQuestion(question: String) {
-        val currentSec = estimatedPlaybackSec()
+        val currentSec = playerClock.currentSec.get()
         val timeFormatted = formatSec(currentSec)
-        appendChatBubble("You", question, isUser = true)
-        val thinkingView = appendChatBubble("AI", "Thinking...")
+        appendChatBubble("You ($timeFormatted)", question, isUser = true)
+        val thinkingView = appendChatBubble("AI", "Reading transcript around $timeFormatted...")
 
         executor.execute {
             val meta = if (videoMeta.cues.isEmpty()) ensureMetadataLoaded(forceRetry = true) else videoMeta
             mainHandler.post { updateStatusBanner(meta) }
 
-            val relevantContext = buildContextWindow(meta, currentSec)
-            val prompt = """
-                You are a concise video assistant running locally on a phone.
-                Answer the user's question based on the video context below.
+            // Retrieve both the live playback window AND the top question-relevant passages across the video
+            val livePassage = getLivePlaybackPassage(meta, currentSec)
+            val relevantPassages = retrieveRelevantPassages(question, meta, currentSec, topK = 4)
+
+            val combinedContext = buildString {
+                if (livePassage.isNotBlank()) {
+                    append("Currently playing at [$timeFormatted]: $livePassage\n\n")
+                }
+                if (relevantPassages.isNotEmpty()) {
+                    append("Relevant parts from the video transcript:\n")
+                    for (p in relevantPassages) {
+                        append("[${formatSec(p.startSec)}-${formatSec(p.endSec)}] ${p.text}\n")
+                    }
+                } else if (meta.description.isNotBlank()) {
+                    append("Video Description: ${meta.description.take(800)}")
+                }
+            }.trim()
+
+            val fullPrompt = """
+                Answer the question clearly and concisely using the video transcript context below.
+                Video Title: ${meta.title.ifBlank { videoId }} by ${meta.author.ifBlank { "Speaker" }}
+                $combinedContext
                 
-                Video Title: ${meta.title.ifBlank { videoId }}
-                Channel: ${meta.author.ifBlank { "Unknown" }}
-                Approx Playback Time: $timeFormatted
-                Description: ${meta.description.take(600)}
-                
-                Transcript Excerpt:
-                $relevantContext
-                
-                User Question: $question
+                Question: $question
+                Answer:
             """.trimIndent()
 
-            val answer = when {
-                ollamaModelName != null -> {
-                    queryLocalOllama(ollamaModelName!!, prompt)
-                        ?: answerWithBuiltInTranscriptAi(question, meta, currentSec)
+            // 1. Try Local Ollama / MediaPipe / On-Device Neural WASM LLM
+            val neuralAnswer = when {
+                ollamaModelName != null -> queryLocalOllama(ollamaModelName!!, fullPrompt)
+                mediaPipeLlmInstance != null -> queryMediaPipeLlm(mediaPipeLlmInstance!!, fullPrompt)
+                isWasmAiReady -> queryWasmNeuralLlm(fullPrompt)
+                else -> null
+            }
+
+            // 2. Synthesize final answer grounded in the transcript
+            val finalAnswer = if (!neuralAnswer.isNullOrBlank() && neuralAnswer.length > 15) {
+                val refTimestamps = relevantPassages.take(2).joinToString(", ") { formatSec(it.startSec) }
+                if (refTimestamps.isNotEmpty()) {
+                    "$neuralAnswer\n\n(Source timestamps: $refTimestamps)"
+                } else {
+                    neuralAnswer
                 }
-                mediaPipeLlmInstance != null -> {
-                    queryMediaPipeLlm(mediaPipeLlmInstance!!, prompt)
-                        ?: answerWithBuiltInTranscriptAi(question, meta, currentSec)
-                }
-                else -> {
-                    val freshOllama = checkLocalOllamaModel()
-                    if (freshOllama != null) {
-                        ollamaModelName = freshOllama
-                        mainHandler.post { engineBadge.text = "🟢 Ollama: $freshOllama" }
-                        queryLocalOllama(freshOllama, prompt)
-                            ?: answerWithBuiltInTranscriptAi(question, meta, currentSec)
-                    } else {
-                        answerWithBuiltInTranscriptAi(question, meta, currentSec)
-                    }
-                }
+            } else {
+                synthesizeAnswerFromTranscript(question, meta, currentSec, livePassage, relevantPassages)
             }
 
             mainHandler.post {
-                thinkingView.text = "AI: $answer"
+                thinkingView.text = "AI: $finalAnswer"
                 chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
             }
         }
     }
 
+    /**
+     * Groups fragmented 2-second caption cues into clean, readable ~25-second spoken paragraphs
+     * so both the AI and the user get complete thoughts instead of broken 4-word lines.
+     */
+    private fun getLivePlaybackPassage(meta: VideoMetadata, currentSec: Int): String {
+        if (meta.cues.isEmpty()) return ""
+        val window = meta.cues.filter { it.startSec in (currentSec - 35)..(currentSec + 35) }
+            .ifEmpty { meta.cues.take(12) }
+        return cleanSpokenText(window.joinToString(" ") { it.text })
+    }
+
+    /**
+     * Scores all passages in the video against the user's question using keyword + stem matching
+     * and proximity to the live playback time.
+     */
+    private fun retrieveRelevantPassages(
+        question: String,
+        meta: VideoMetadata,
+        currentSec: Int,
+        topK: Int
+    ): List<TranscriptPassage> {
+        if (meta.passages.isEmpty()) return emptyList()
+        val qLower = question.lowercase()
+
+        // If the user asks about the "current part" or "right now", prioritize passages around currentSec
+        val isCurrentTimeQuery = qLower.contains("current") ||
+            qLower.contains("right now") ||
+            qLower.contains("this moment") ||
+            qLower.contains("this part") ||
+            qLower.contains("talking about now")
+
+        if (isCurrentTimeQuery) {
+            return meta.passages
+                .sortedBy { abs(it.startSec - currentSec) }
+                .take(2)
+        }
+
+        // If user asks for a summary or takeaways, sample key passages across the beginning, middle, and end
+        if (qLower.contains("summar") || qLower.contains("takeaway") || qLower.contains("overview")) {
+            val total = meta.passages.size
+            val indices = listOf(0, total / 4, total / 2, (total * 3) / 4, total - 1)
+                .distinct()
+                .filter { it in meta.passages.indices }
+            return indices.map { meta.passages[it] }
+        }
+
+        val stopWords = setOf(
+            "what", "when", "where", "which", "who", "whom", "this", "that", "these",
+            "those", "does", "about", "video", "explain", "tell", "from", "with", "have",
+            "how", "why", "can", "you", "the", "and", "for", "are", "was", "were", "speaker", "talk"
+        )
+
+        val queryTokens = qLower.split(Regex("[^a-z0-9]+"))
+            .filter { it.length >= 2 && it !in stopWords }
+            .distinct()
+
+        if (queryTokens.isEmpty()) {
+            return meta.passages.sortedBy { abs(it.startSec - currentSec) }.take(topK)
+        }
+
+        val scored = meta.passages.map { passage ->
+            val pLower = passage.text.lowercase()
+            var score = 0.0
+            for (token in queryTokens) {
+                if (pLower.contains(token)) {
+                    score += 2.5
+                } else if (token.length >= 5 && pLower.contains(token.take(4))) {
+                    // Stem match (e.g. "combinator" / "functional" / "recursion")
+                    score += 1.2
+                }
+            }
+            // Slight boost for passages close to what the user is currently watching
+            if (abs(passage.startSec - currentSec) <= 90) {
+                score += 0.8
+            }
+            passage to score
+        }.sortedByDescending { it.second }
+
+        val matches = scored.filter { it.second > 0.0 }.take(topK).map { it.first }
+        return matches.ifEmpty {
+            meta.passages.sortedBy { abs(it.startSec - currentSec) }.take(2)
+        }
+    }
+
+    /**
+     * Synthesizes a direct, readable answer from the transcript passages when offline or
+     * before the neural model finishes loading.
+     */
+    private fun synthesizeAnswerFromTranscript(
+        question: String,
+        meta: VideoMetadata,
+        currentSec: Int,
+        livePassage: String,
+        relevantPassages: List<TranscriptPassage>
+    ): String {
+        val qLower = question.lowercase()
+
+        if (meta.cues.isEmpty() && meta.description.isBlank()) {
+            return "Captions are still loading for this video. Tap the status line above to reload."
+        }
+
+        // 1. Current Playback Explanation
+        if (qLower.contains("current") || qLower.contains("right now") || qLower.contains("this moment") || qLower.contains("this part")) {
+            if (livePassage.isNotBlank()) {
+                return "At [${formatSec(currentSec)}], ${meta.author.ifBlank { "the speaker" }} is explaining:\n\n" +
+                    "$livePassage"
+            }
+        }
+
+        // 2. Video Summary / Key Takeaways
+        if (qLower.contains("summar") || qLower.contains("takeaway") || qLower.contains("overview")) {
+            val sb = StringBuilder()
+            sb.append("Summary of \"${meta.title.ifBlank { videoId }}\"")
+            if (meta.author.isNotBlank()) sb.append(" (${meta.author})")
+            sb.append(":\n\n")
+
+            if (relevantPassages.isNotEmpty()) {
+                for ((idx, p) in relevantPassages.take(4).withIndex()) {
+                    val concise = summarizeParagraph(p.text, maxSentences = 2)
+                    sb.append("${idx + 1}. [${formatSec(p.startSec)}] $concise\n\n")
+                }
+            } else if (meta.description.isNotBlank()) {
+                sb.append(meta.description.take(500))
+            }
+            return sb.toString().trim()
+        }
+
+        // 3. Specific Question Answered from Retrieved Transcript Passages
+        if (relevantPassages.isNotEmpty()) {
+            val primary = relevantPassages.first()
+            val supporting = relevantPassages.drop(1).take(2)
+            val sb = StringBuilder()
+            sb.append("Based on the talk at [${formatSec(primary.startSec)}]:\n")
+            sb.append(summarizeParagraph(primary.text, maxSentences = 3))
+
+            if (supporting.isNotEmpty()) {
+                sb.append("\n\nRelated points mentioned at ")
+                sb.append(supporting.joinToString(" & ") { "[${formatSec(it.startSec)}]" })
+                sb.append(":\n")
+                sb.append(supporting.joinToString("\n• ", prefix = "• ") { summarizeParagraph(it.text, maxSentences = 2) })
+            }
+            return sb.toString().trim()
+        }
+
+        return if (livePassage.isNotBlank()) {
+            "Around [${formatSec(currentSec)}], the speaker discusses:\n$livePassage"
+        } else {
+            meta.description.take(450).ifBlank { "No matching transcript lines found." }
+        }
+    }
+
+    private fun cleanSpokenText(raw: String): String {
+        val cleaned = raw
+            .replace(Regex("\\s+"), " ")
+            .replace(Regex("(?i)\\b(um|uh|er|ah)\\b"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (cleaned.isEmpty()) return ""
+        return cleaned.replaceFirstChar { it.uppercase() }
+    }
+
+    private fun summarizeParagraph(text: String, maxSentences: Int): String {
+        val clean = cleanSpokenText(text)
+        val sentences = clean.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
+        return if (sentences.size <= maxSentences) {
+            if (clean.endsWith(".") || clean.endsWith("?") || clean.endsWith("!")) clean else "$clean."
+        } else {
+            val joined = sentences.take(maxSentences).joinToString(" ")
+            if (joined.endsWith(".") || joined.endsWith("?") || joined.endsWith("!")) joined else "$joined."
+        }
+    }
+
     private fun showCurrentTranscriptExcerpt() {
-        val loadingBubble = appendChatBubble("AI", "Loading transcript excerpt...")
+        val currentSec = playerClock.currentSec.get()
+        val loadingBubble = appendChatBubble("AI", "Fetching transcript around ${formatSec(currentSec)}...")
         executor.execute {
             val meta = if (videoMeta.cues.isEmpty()) ensureMetadataLoaded(forceRetry = true) else videoMeta
-            val currentSec = estimatedPlaybackSec()
-
             val resultText = if (meta.cues.isNotEmpty()) {
-                val minSec = (currentSec - 90).coerceAtLeast(0)
-                val maxSec = currentSec + 120
-                val nearby = meta.cues.filter { it.startSec in minSec..maxSec }.ifEmpty { meta.cues.take(20) }
-                "Transcript (${meta.cues.size} total lines):\n" +
-                    nearby.take(25).joinToString("\n") { "[${formatSec(it.startSec)}] ${it.text}" }
+                val minSec = (currentSec - 60).coerceAtLeast(0)
+                val maxSec = currentSec + 90
+                val nearby = meta.cues.filter { it.startSec in minSec..maxSec }.ifEmpty { meta.cues.take(18) }
+                "Live Transcript around [${formatSec(currentSec)}]:\n" +
+                    nearby.take(22).joinToString("\n") { cue ->
+                        val marker = if (abs(cue.startSec - currentSec) <= 5) "▶ " else "   "
+                        "$marker[${formatSec(cue.startSec)}] ${cue.text}"
+                    }
             } else if (meta.description.isNotBlank()) {
-                "No closed-caption track returned; video description:\n\n${meta.description.take(700)}"
+                "No closed captions found; video description:\n\n${meta.description.take(700)}"
             } else {
-                "Could not load captions for ${meta.title.ifBlank { videoId }}. Check connection and tap the status bar above to retry."
+                "Could not load captions for ${meta.title.ifBlank { videoId }}. Tap the status bar above to retry."
             }
 
             mainHandler.post {
@@ -511,109 +923,14 @@ private class LocalAiPanelView(
         return bubble
     }
 
-    private fun buildContextWindow(meta: VideoMetadata, currentSec: Int): String {
-        if (meta.cues.isEmpty()) {
-            return meta.description.ifBlank { "Video Title: ${meta.title} by ${meta.author}" }.take(1500)
-        }
-        val minSec = (currentSec - 180).coerceAtLeast(0)
-        val maxSec = currentSec + 180
-        val windowCues = meta.cues.filter { it.startSec in minSec..maxSec }
-        val selected = if (windowCues.size >= 5) windowCues else meta.cues.take(60)
-        return selected.take(80).joinToString("\n") { "[${formatSec(it.startSec)}] ${it.text}" }
-    }
-
-    private fun answerWithBuiltInTranscriptAi(
-        question: String,
-        meta: VideoMetadata,
-        currentSec: Int
-    ): String {
-        val qLower = question.lowercase()
-        val allCues = meta.cues
-
-        if (qLower.contains("current") || qLower.contains("right now") || qLower.contains("this part")) {
-            if (allCues.isNotEmpty()) {
-                val nearby = allCues.filter { abs(it.startSec - currentSec) <= 60 }
-                    .ifEmpty { allCues.take(10) }
-                val joined = nearby.take(12).joinToString(" ") { it.text }
-                return "Around [${formatSec(currentSec)}], the speaker says:\n\"$joined\""
-            }
-        }
-
-        if (qLower.contains("summar") || qLower.contains("takeaway") || qLower.contains("about") || qLower.contains("point")) {
-            val sb = StringBuilder()
-            if (meta.title.isNotBlank()) sb.append("• Video: ${meta.title}\n")
-            if (meta.author.isNotBlank()) sb.append("• Speaker / Channel: ${meta.author}\n")
-            if (allCues.isNotEmpty()) {
-                val total = allCues.size
-                val indices = listOf(0, total / 5, (total * 2) / 5, (total * 3) / 5, (total * 4) / 5)
-                    .distinct()
-                    .filter { it in allCues.indices }
-
-                sb.append("• Key highlights across the talk:\n")
-                for (idx in indices) {
-                    val chunk = allCues.subList(idx, (idx + 3).coerceAtMost(total))
-                    val text = chunk.joinToString(" ") { it.text }
-                    sb.append("  [${formatSec(chunk.first().startSec)}] $text\n")
-                }
-            } else if (meta.description.isNotBlank()) {
-                sb.append("• Overview: ${meta.description.take(450)}")
-            } else {
-                sb.append("• Topic: ${meta.title}")
-            }
-            return sb.toString().trim()
-        }
-
-        val stopWords = setOf(
-            "what", "when", "where", "which", "who", "whom", "this", "that", "these",
-            "those", "does", "about", "video", "explain", "tell", "from", "with", "have", "how", "why"
-        )
-        val keywords = qLower.split(Regex("[^a-z0-9]+"))
-            .filter { it.length >= 2 && it !in stopWords }
-
-        if (allCues.isNotEmpty() && keywords.isNotEmpty()) {
-            val windows = allCues.chunked(4)
-            val scored = windows.map { chunk ->
-                val textCombined = chunk.joinToString(" ") { it.text }
-                val textLower = textCombined.lowercase()
-                val keywordHits = keywords.count { kw -> textLower.contains(kw) }
-                val timeBonus = if (abs(chunk.first().startSec - currentSec) <= 120) 0.4 else 0.0
-                Triple(chunk.first().startSec, textCombined, keywordHits + timeBonus)
-            }.sortedByDescending { it.third }
-
-            val bestMatches = scored.filter { it.third >= 1.0 }.take(3)
-            if (bestMatches.isNotEmpty()) {
-                return bestMatches.joinToString("\n\n") { (sec, txt, _) ->
-                    "[${formatSec(sec)}] \"$txt\""
-                }
-            }
-        }
-
-        return when {
-            allCues.isNotEmpty() -> {
-                val nearCurrent = allCues.filter { abs(it.startSec - currentSec) <= 75 }.ifEmpty { allCues.take(8) }
-                "From the transcript near [${formatSec(currentSec)}]:\n\"${nearCurrent.take(10).joinToString(" ") { it.text }}\""
-            }
-            meta.description.isNotBlank() -> {
-                "From the video description:\n${meta.description.take(500)}"
-            }
-            else -> {
-                "Video: \"${meta.title}\" by ${meta.author}. (No closed captions were returned by YouTube for this video.)"
-            }
-        }
-    }
-
     /**
-     * Multi-layered YouTube metadata & caption fetcher:
-     * 1. Innertube ANDROID_VR, IOS, and ANDROID 20.x clients
-     * 2. Watch page HTML bracket-balanced extractor for `captionTracks` and `shortDescription`
-     * 3. Piped public API fallback
-     * 4. Universal parser supporting json3, srv3 (<p t="...">), srv1 (<text start="...">), and vtt
+     * Multi-layered YouTube metadata & caption fetcher + 25-second passage chunker.
      */
     private fun fetchYouTubeContext(vid: String): VideoMetadata {
         var title = ""
         var author = ""
         var description = ""
-        val captionCandidates = mutableListOf<Pair<String, String>>() // (url, userAgent)
+        val captionCandidates = mutableListOf<Pair<String, String>>()
 
         data class ClientSpec(val name: String, val version: String, val ua: String, val extraJson: String = "")
 
@@ -638,7 +955,6 @@ private class LocalAiPanelView(
             )
         )
 
-        // 1. Try Innertube clients
         for (client in clients) {
             if (captionCandidates.isNotEmpty() && title.isNotBlank() && description.isNotBlank()) break
             try {
@@ -681,7 +997,6 @@ private class LocalAiPanelView(
             } catch (_: Exception) {}
         }
 
-        // 2. Try Watch Page HTML extraction with balanced JSON array matching
         if (captionCandidates.isEmpty() || description.isBlank()) {
             try {
                 val desktopUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -711,14 +1026,12 @@ private class LocalAiPanelView(
             } catch (_: Exception) {}
         }
 
-        // 3. Parse captions from candidate URLs
         var parsedCues = emptyList<TranscriptCue>()
         for ((rawUrl, ua) in captionCandidates) {
             parsedCues = downloadAndParseCaptions(rawUrl, ua)
             if (parsedCues.isNotEmpty()) break
         }
 
-        // 4. Fallback: Piped API if YouTube throttled direct timedtext requests
         if (parsedCues.isEmpty() || description.isBlank()) {
             val pipedHosts = listOf(
                 "https://pipedapi.kavin.rocks",
@@ -753,7 +1066,6 @@ private class LocalAiPanelView(
             }
         }
 
-        // 5. Final fallback for title/author via noembed
         if (title.isBlank()) {
             try {
                 val noembed = httpGet("https://noembed.com/embed?url=https://www.youtube.com/watch?v=$vid", "Mozilla/5.0")
@@ -765,13 +1077,52 @@ private class LocalAiPanelView(
             } catch (_: Exception) {}
         }
 
+        val passages = buildPassagesFromCues(parsedCues)
+
         return VideoMetadata(
             videoId = vid,
             title = title,
             author = author,
             description = description,
-            cues = parsedCues
+            cues = parsedCues,
+            passages = passages
         )
+    }
+
+    private fun buildPassagesFromCues(cues: List<TranscriptCue>): List<TranscriptPassage> {
+        if (cues.isEmpty()) return emptyList()
+        val result = mutableListOf<TranscriptPassage>()
+        var chunkStart = cues.first().startSec
+        var lastSec = chunkStart
+        val sb = StringBuilder()
+
+        for (cue in cues) {
+            if (sb.isNotEmpty()) sb.append(" ")
+            sb.append(cue.text)
+            lastSec = cue.startSec
+
+            if (cue.startSec - chunkStart >= 25 || sb.length >= 280) {
+                result.add(
+                    TranscriptPassage(
+                        startSec = chunkStart,
+                        endSec = lastSec,
+                        text = cleanSpokenText(sb.toString())
+                    )
+                )
+                sb.clear()
+                chunkStart = cue.startSec
+            }
+        }
+        if (sb.isNotEmpty()) {
+            result.add(
+                TranscriptPassage(
+                    startSec = chunkStart,
+                    endSec = lastSec,
+                    text = cleanSpokenText(sb.toString())
+                )
+            )
+        }
+        return result
     }
 
     private fun pickBestCaptionUrl(tracks: JSONArray?): String? {
@@ -792,7 +1143,6 @@ private class LocalAiPanelView(
     }
 
     private fun downloadAndParseCaptions(baseUrl: String, userAgent: String): List<TranscriptCue> {
-        // Attempt 1: Force fmt=json3 (replacing any existing fmt=srv3/srv1)
         val json3Url = if (baseUrl.contains("fmt=")) {
             baseUrl.replace(Regex("fmt=[^&]+"), "fmt=json3")
         } else {
@@ -808,15 +1158,11 @@ private class LocalAiPanelView(
         return emptyList()
     }
 
-    /**
-     * Parses JSON3, SRV3 (<p t="ms">), SRV1 (<text start="sec">), and WebVTT caption formats.
-     */
     private fun parseCaptionPayload(payload: String): List<TranscriptCue> {
         val trimmed = payload.trimStart()
         if (trimmed.isEmpty()) return emptyList()
         val cues = mutableListOf<TranscriptCue>()
 
-        // Format A: JSON3
         if (trimmed.startsWith("{")) {
             try {
                 val events = JSONObject(trimmed).optJSONArray("events") ?: JSONArray()
@@ -837,7 +1183,6 @@ private class LocalAiPanelView(
             } catch (_: Exception) {}
         }
 
-        // Format B: SRV3 XML (<p t="12340" d="3000"><s>word</s>...</p>)
         val srv3Regex = Regex("""<p\s+[^>]*\bt="(\d+)"[^>]*>(.*?)</p>""", RegexOption.DOT_MATCHES_ALL)
         for (match in srv3Regex.findAll(trimmed)) {
             val startMs = match.groupValues[1].toLongOrNull() ?: 0L
@@ -852,7 +1197,6 @@ private class LocalAiPanelView(
         }
         if (cues.isNotEmpty()) return cues
 
-        // Format C: SRV1 XML (<text start="12.34" dur="3.2">...</text>)
         val srv1Regex = Regex("""<text\s+[^>]*\bstart="([\d.]+)"[^>]*>(.*?)</text>""", RegexOption.DOT_MATCHES_ALL)
         for (match in srv1Regex.findAll(trimmed)) {
             val startSec = match.groupValues[1].toDoubleOrNull()?.toInt() ?: 0
@@ -867,7 +1211,6 @@ private class LocalAiPanelView(
         }
         if (cues.isNotEmpty()) return cues
 
-        // Format D: WebVTT
         if (trimmed.startsWith("WEBVTT")) {
             val lines = trimmed.lines()
             val timeRegex = Regex("""(?:(\d+):)?(\d{2}):(\d{2})[.,]\d+\s*-->""")
@@ -1095,6 +1438,12 @@ private class LocalAiPanelView(
     }
 
     fun cleanup() {
+        mainHandler.removeCallbacks(clockTicker)
+        try {
+            wasmAiWebView?.stopLoading()
+            wasmAiWebView?.destroy()
+        } catch (_: Throwable) {}
+        wasmAiWebView = null
         try {
             mediaPipeLlmInstance?.let { instance ->
                 instance.javaClass.getMethod("close").invoke(instance)
