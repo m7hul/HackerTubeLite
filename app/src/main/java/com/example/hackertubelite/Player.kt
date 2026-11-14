@@ -174,7 +174,7 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
                 }
             )
 
-            // 2. BOTTOM: Local AI Panel synced with the video player
+            // 2. BOTTOM: Collapsible & Lazy-Activated Local AI Panel
             AndroidView(
                 modifier = Modifier.fillMaxWidth(),
                 factory = { ctx ->
@@ -199,14 +199,20 @@ private class LocalAiPanelView(
     private val executor = Executors.newCachedThreadPool()
     private val fetchLock = Any()
 
-    // Initialized directly at declaration so Kotlin's definite-assignment check always passes
+    // UI elements initialized at declaration
+    private val headerTitle: TextView = TextView(context)
     private val timeBadge: TextView = TextView(context)
     private val engineBadge: TextView = TextView(context)
+    private val toggleButton: TextView = TextView(context)
+    private val expandableBody: LinearLayout = LinearLayout(context)
     private val statusText: TextView = TextView(context)
     private val chatContainer: LinearLayout = LinearLayout(context)
     private val chatScroll: ScrollView = ScrollView(context)
     private val questionInput: EditText = EditText(context)
     private val askButton: TextView = TextView(context)
+
+    private var isExpanded = false
+    private var hasActivated = false
 
     private var wasmAiWebView: WebView? = null
 
@@ -223,7 +229,7 @@ private class LocalAiPanelView(
     private var videoMeta = VideoMetadata(videoId = videoId)
 
     @Volatile
-    private var isFetchingMeta = true
+    private var isFetchingMeta = false
 
     @Volatile
     private var mediaPipeLlmInstance: Any? = null
@@ -233,6 +239,7 @@ private class LocalAiPanelView(
 
     private val clockTicker = object : Runnable {
         override fun run() {
+            if (!isExpanded) return
             val sec = playerClock.currentSec.get()
             val synced = playerClock.isLiveSynced.get()
             timeBadge.text = "⏱️ ${formatSec(sec)}"
@@ -245,37 +252,41 @@ private class LocalAiPanelView(
 
     init {
         orientation = VERTICAL
-        setPadding(dp(12), dp(10), dp(12), dp(12))
+        setPadding(dp(12), dp(8), dp(12), dp(8))
         setBackgroundColor(Color.parseColor("#121212"))
         layoutParams = LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         )
 
-        // Header Row
+        // Compact Collapsible Header Bar (Always visible, ~40dp height)
         val headerRow = LinearLayout(context).apply {
             orientation = HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            background = roundedBg("#1A1F24", dp(12), strokeColor = "#2A323A")
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             layoutParams = LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
+            setOnClickListener { togglePanel() }
         }
 
-        val headerTitle = TextView(context).apply {
-            text = "🤖 Local Video AI"
+        headerTitle.apply {
+            text = "🤖 Ask Local Video AI"
             setTextColor(Color.parseColor("#00E676"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             setTypeface(typeface, Typeface.BOLD)
             layoutParams = LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
         timeBadge.apply {
             text = "⏱️ 00:00"
+            visibility = View.GONE // Hidden until expanded
             setTextColor(Color.parseColor("#B0BEC5"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setPadding(dp(8), dp(4), dp(8), dp(4))
-            background = roundedBg("#1A2621", dp(12), strokeColor = "#2E4C3E")
+            background = roundedBg("#1A2621", dp(10), strokeColor = "#2E4C3E")
             val lp = LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -285,11 +296,18 @@ private class LocalAiPanelView(
         }
 
         engineBadge.apply {
-            text = "⏳ Loading AI..."
+            text = "⏳ Starting..."
+            visibility = View.GONE // Hidden until expanded
             setTextColor(Color.parseColor("#B0BEC5"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setPadding(dp(8), dp(4), dp(8), dp(4))
-            background = roundedBg("#1E272C", dp(12))
+            background = roundedBg("#263238", dp(10))
+            val lp = LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            lp.marginEnd = dp(6)
+            layoutParams = lp
             setOnClickListener {
                 if (!isWasmAiReady && !isWasmAiLoading) {
                     initOnDeviceWasmLlm()
@@ -299,23 +317,48 @@ private class LocalAiPanelView(
             }
         }
 
+        toggleButton.apply {
+            text = "▼ Open"
+            setTextColor(Color.parseColor("#E0E0E0"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            background = roundedBg("#263238", dp(10))
+            layoutParams = LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
         headerRow.addView(headerTitle)
         headerRow.addView(timeBadge)
         headerRow.addView(engineBadge)
+        headerRow.addView(toggleButton)
         addView(headerRow)
+
+        // Expandable Body (Collapsed by default so portrait screen stays clean)
+        expandableBody.apply {
+            orientation = VERTICAL
+            visibility = View.GONE
+            setPadding(dp(2), dp(8), dp(2), dp(4))
+            layoutParams = LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
 
         // Status Line
         statusText.apply {
             text = "⏳ Fetching video transcript & captions..."
             setTextColor(Color.parseColor("#9E9E9E"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, dp(4), 0, dp(8))
+            setPadding(dp(2), dp(2), dp(2), dp(8))
             setOnClickListener {
                 text = "🔄 Reloading transcript..."
                 loadVideoMetadataAndTranscript(forceRetry = true)
             }
         }
-        addView(statusText)
+        expandableBody.addView(statusText)
 
         // Quick Prompt Chips
         val chipScroll = HorizontalScrollView(context).apply {
@@ -361,11 +404,11 @@ private class LocalAiPanelView(
             chipRow.addView(chip)
         }
         chipScroll.addView(chipRow)
-        addView(chipScroll)
+        expandableBody.addView(chipScroll)
 
-        // Scrollable Chat Box
+        // Scrollable Chat Box (Compact height so video + controls fit comfortably)
         chatScroll.apply {
-            layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(200))
+            layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(170))
             background = roundedBg("#181818", dp(10), strokeColor = "#2A2A2A")
             setPadding(dp(10), dp(10), dp(10), dp(10))
             setOnTouchListener { v, event ->
@@ -384,7 +427,7 @@ private class LocalAiPanelView(
             )
         }
         chatScroll.addView(chatContainer)
-        addView(chatScroll)
+        expandableBody.addView(chatScroll)
 
         // Input Row
         val inputRow = LinearLayout(context).apply {
@@ -447,17 +490,45 @@ private class LocalAiPanelView(
 
         inputRow.addView(questionInput)
         inputRow.addView(askButton)
-        addView(inputRow)
+        expandableBody.addView(inputRow)
 
-        appendChatBubble(
-            sender = "AI",
-            message = "Synced with the video player! Ask any question below or tap '🎯 Explain Current Part' while watching."
-        )
+        addView(expandableBody)
+    }
 
-        mainHandler.post(clockTicker)
-        loadVideoMetadataAndTranscript(forceRetry = false)
-        detectLocalAiBackends(showToastInChat = false)
-        initOnDeviceWasmLlm()
+    /**
+     * Expands or collapses the Local AI panel, and lazy-initializes the AI & transcript
+     * only the first time the user clicks to open it.
+     */
+    private fun togglePanel() {
+        isExpanded = !isExpanded
+        if (isExpanded) {
+            expandableBody.visibility = View.VISIBLE
+            timeBadge.visibility = View.VISIBLE
+            engineBadge.visibility = View.VISIBLE
+            headerTitle.text = "🤖 Local AI"
+            toggleButton.text = "▲ Hide"
+
+            if (!hasActivated) {
+                hasActivated = true
+                appendChatBubble(
+                    sender = "AI",
+                    message = "Local AI activated! Ask any question below or tap '🎯 Explain Current Part' while watching."
+                )
+                loadVideoMetadataAndTranscript(forceRetry = false)
+                detectLocalAiBackends(showToastInChat = false)
+                initOnDeviceWasmLlm()
+            }
+            mainHandler.removeCallbacks(clockTicker)
+            mainHandler.post(clockTicker)
+        } else {
+            hideKeyboard()
+            mainHandler.removeCallbacks(clockTicker)
+            expandableBody.visibility = View.GONE
+            timeBadge.visibility = View.GONE
+            engineBadge.visibility = View.GONE
+            headerTitle.text = "🤖 Ask Local Video AI"
+            toggleButton.text = "▼ Open"
+        }
     }
 
     private fun initOnDeviceWasmLlm() {
@@ -489,7 +560,7 @@ private class LocalAiPanelView(
                             isWasmAiLoading = false
                             mainHandler.post {
                                 if (ollamaModelName == null && mediaPipeLlmInstance == null) {
-                                    engineBadge.text = "🟢 Local Neural AI"
+                                    engineBadge.text = "🟢 Neural AI"
                                     engineBadge.setTextColor(Color.parseColor("#00E676"))
                                 }
                             }
@@ -500,7 +571,7 @@ private class LocalAiPanelView(
                             isWasmAiLoading = false
                             mainHandler.post {
                                 if (ollamaModelName == null && mediaPipeLlmInstance == null) {
-                                    engineBadge.text = "⚡ Smart Transcript AI"
+                                    engineBadge.text = "⚡ Smart AI"
                                 }
                             }
                         }
@@ -628,7 +699,7 @@ private class LocalAiPanelView(
             if (detectedOllama != null) {
                 ollamaModelName = detectedOllama
                 mainHandler.post {
-                    engineBadge.text = "🟢 Ollama: $detectedOllama"
+                    engineBadge.text = "🟢 Ollama"
                     engineBadge.setTextColor(Color.parseColor("#00E676"))
                     if (showToastInChat) {
                         appendChatBubble("System", "Connected to local Ollama model: $detectedOllama")
@@ -644,7 +715,7 @@ private class LocalAiPanelView(
                     if (loaded != null) {
                         mediaPipeLlmInstance = loaded
                         mainHandler.post {
-                            engineBadge.text = "🟢 On-Device: ${modelFile.name.take(12)}"
+                            engineBadge.text = "🟢 On-Device"
                             engineBadge.setTextColor(Color.parseColor("#00E676"))
                             if (showToastInChat) {
                                 appendChatBubble("System", "Loaded MediaPipe model: ${modelFile.name}")
@@ -659,7 +730,7 @@ private class LocalAiPanelView(
 
             mainHandler.post {
                 if (isWasmAiReady) {
-                    engineBadge.text = "🟢 Local Neural AI"
+                    engineBadge.text = "🟢 Neural AI"
                     engineBadge.setTextColor(Color.parseColor("#00E676"))
                     if (showToastInChat) {
                         appendChatBubble("System", "On-Device Neural AI (LaMini-Flan-T5) is active.")
