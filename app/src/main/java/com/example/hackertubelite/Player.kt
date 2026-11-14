@@ -17,6 +17,8 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 
 /** Implemented by MainActivity so the WebView can go fullscreen (landscape, bars hidden). */
 interface FullscreenController {
@@ -29,6 +31,18 @@ val LocalFullscreen = compositionLocalOf<FullscreenController?> { null }
 private class WebHolder {
     var web: WebView? = null
 }
+
+/**
+ * Some phones can't decode YouTube's AV1/VP9 streams and show a black picture with working sound.
+ * This tells the player those codecs are unsupported so it serves H.264 instead.
+ */
+private const val CODEC_SCRIPT =
+    "(function(){var ok=function(t){return !(t&&/av01|vp09|vp9|vp8/i.test(t));};" +
+        "var ms=window.MediaSource;" +
+        "if(ms&&ms.isTypeSupported){var o=ms.isTypeSupported.bind(ms);" +
+        "ms.isTypeSupported=function(t){return ok(t)&&o(t);};}" +
+        "var p=HTMLMediaElement.prototype.canPlayType;" +
+        "HTMLMediaElement.prototype.canPlayType=function(t){return ok(t)?p.call(this,t):'';};})();"
 
 private val ALLOWED_HOSTS = setOf("www.youtube-nocookie.com", "www.youtube.com")
 
@@ -65,7 +79,6 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
         factory = { ctx ->
             WebView(ctx).apply {
                 holder.web = this
-                setLayerType(View.LAYER_TYPE_HARDWARE, null)
                 settings.javaScriptEnabled = true // required by the YouTube player
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
@@ -77,6 +90,11 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
                 settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
                 settings.safeBrowsingEnabled = true
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, false)
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    WebViewCompat.addDocumentStartJavaScript(
+                        this, CODEC_SCRIPT, setOf("https://www.youtube-nocookie.com")
+                    )
+                }
 
                 webViewClient = object : WebViewClient() {
                     // Returning true blocks the navigation.
