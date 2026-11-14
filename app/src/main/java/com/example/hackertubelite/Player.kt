@@ -199,13 +199,14 @@ private class LocalAiPanelView(
     private val executor = Executors.newCachedThreadPool()
     private val fetchLock = Any()
 
-    private val timeBadge: TextView
-    private val engineBadge: TextView
-    private val statusText: TextView
-    private val chatContainer: LinearLayout
-    private val chatScroll: ScrollView
-    private val questionInput: EditText
-    private val askButton: TextView
+    // Initialized directly at declaration so Kotlin's definite-assignment check always passes
+    private val timeBadge: TextView = TextView(context)
+    private val engineBadge: TextView = TextView(context)
+    private val statusText: TextView = TextView(context)
+    private val chatContainer: LinearLayout = LinearLayout(context)
+    private val chatScroll: ScrollView = ScrollView(context)
+    private val questionInput: EditText = EditText(context)
+    private val askButton: TextView = TextView(context)
 
     private var wasmAiWebView: WebView? = null
 
@@ -269,7 +270,7 @@ private class LocalAiPanelView(
             layoutParams = LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        timeBadge = TextView(context).apply {
+        timeBadge.apply {
             text = "⏱️ 00:00"
             setTextColor(Color.parseColor("#B0BEC5"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
@@ -283,7 +284,7 @@ private class LocalAiPanelView(
             layoutParams = lp
         }
 
-        engineBadge = TextView(context).apply {
+        engineBadge.apply {
             text = "⏳ Loading AI..."
             setTextColor(Color.parseColor("#B0BEC5"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
@@ -304,7 +305,7 @@ private class LocalAiPanelView(
         addView(headerRow)
 
         // Status Line
-        statusText = TextView(context).apply {
+        statusText.apply {
             text = "⏳ Fetching video transcript & captions..."
             setTextColor(Color.parseColor("#9E9E9E"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -363,7 +364,7 @@ private class LocalAiPanelView(
         addView(chipScroll)
 
         // Scrollable Chat Box
-        chatScroll = ScrollView(context).apply {
+        chatScroll.apply {
             layoutParams = LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(200))
             background = roundedBg("#181818", dp(10), strokeColor = "#2A2A2A")
             setPadding(dp(10), dp(10), dp(10), dp(10))
@@ -375,7 +376,7 @@ private class LocalAiPanelView(
             }
         }
 
-        chatContainer = LinearLayout(context).apply {
+        chatContainer.apply {
             orientation = VERTICAL
             layoutParams = LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -397,7 +398,7 @@ private class LocalAiPanelView(
             layoutParams = lp
         }
 
-        questionInput = EditText(context).apply {
+        questionInput.apply {
             hint = "Ask anything about this video..."
             setHintTextColor(Color.parseColor("#757575"))
             setTextColor(Color.WHITE)
@@ -420,7 +421,7 @@ private class LocalAiPanelView(
             }
         }
 
-        askButton = TextView(context).apply {
+        askButton.apply {
             text = "Ask"
             setTextColor(Color.BLACK)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -687,7 +688,6 @@ private class LocalAiPanelView(
             val livePassage = getLivePlaybackPassage(meta, currentSec)
             val relevantPassages = retrieveRelevantPassages(question, meta, currentSec, topK = 3)
 
-            // Keep context concise (~320 words max) and put Question FIRST so compact local models never truncate the question
             val compactTranscriptContext = buildString {
                 if (livePassage.isNotBlank()) {
                     append("Current playback [$timeFormatted]: ${livePassage.take(450)}\n")
