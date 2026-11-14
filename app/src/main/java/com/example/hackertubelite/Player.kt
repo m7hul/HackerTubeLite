@@ -65,7 +65,7 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
         factory = { ctx ->
             WebView(ctx).apply {
                 holder.web = this
-                setBackgroundColor(android.graphics.Color.BLACK)
+                setLayerType(View.LAYER_TYPE_HARDWARE, null)
                 settings.javaScriptEnabled = true // required by the YouTube player
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
@@ -98,9 +98,12 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
                     }
                 }
 
-                val html = "<html><body style='margin:0;background:#000'>" +
-                    "<iframe width='100%' height='100%' style='border:0' " +
-                    "src='https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&playsinline=1&rel=0' " +
+                val html = "<html><head>" +
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+                    "<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}" +
+                    "iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}</style>" +
+                    "</head><body>" +
+                    "<iframe src='https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&playsinline=1&rel=0' " +
                     "allow='autoplay; encrypted-media; fullscreen' allowfullscreen></iframe>" +
                     "</body></html>"
                 loadDataWithBaseURL("https://www.youtube-nocookie.com", html, "text/html", "utf-8", null)
