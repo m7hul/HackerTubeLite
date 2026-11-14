@@ -78,7 +78,8 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
         modifier = modifier,
         factory = { ctx ->
             WebView(ctx).apply {
-                holder.web = this setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                holder.web = this
+                setLayerType(View.LAYER_TYPE_SOFTWARE, null)
                 settings.javaScriptEnabled = true // required by the YouTube player
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
