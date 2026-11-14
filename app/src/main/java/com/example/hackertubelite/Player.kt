@@ -19,7 +19,7 @@ val LocalFullscreen = compositionLocalOf<FullscreenController?> { null }
 
 /**
  * TEST BUILD: minimal YouTube embed with no extra hardening, to find what broke the picture.
- * The grey background and "Loading player..." text show whether the page paints at all.
+ * The iframe height is set from the width (56.25vw) because percentage heights collapsed to zero.
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -47,9 +47,9 @@ fun YouTubePlayer(videoId: String, modifier: Modifier = Modifier) {
 
                 val html = "<html><head>" +
                     "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
-                    "<style>html,body{margin:0;height:100%;background:#222;color:#aaa;font:14px sans-serif}" +
-                    "p{position:absolute;top:45%;width:100%;text-align:center;margin:0}" +
-                    "iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}</style>" +
+                    "<style>html,body{margin:0;background:#000;overflow:hidden}" +
+                    "p{margin:0;padding:12px;text-align:center;color:#888;font:14px sans-serif}" +
+                    "iframe{position:absolute;left:0;top:0;width:100vw;height:56.25vw;border:0}</style>" +
                     "</head><body><p>Loading player...</p>" +
                     "<iframe src='https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&playsinline=1&rel=0' " +
                     "allow='autoplay; encrypted-media; fullscreen' allowfullscreen></iframe>" +
