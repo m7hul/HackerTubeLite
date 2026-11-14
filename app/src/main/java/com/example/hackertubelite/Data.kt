@@ -12,6 +12,7 @@ data class Video(
     @SerialName("s") val summary: String = "",
     @SerialName("w") val why: String = "",
     @SerialName("k") val type: String = "",
+    @SerialName("lv") val level: String = "general",
     @SerialName("p") val topic: String = "",
     @SerialName("g") val tags: List<String> = emptyList(),
     @SerialName("a") val cats: List<String> = emptyList(),
@@ -31,6 +32,18 @@ data class Cat(val id: String, val n: String)
 
 @Serializable
 data class Area(val id: String, val n: String, val c: List<Cat>)
+
+@Serializable
+data class PathModule(val id: String, val n: String, val l: List<String>)
+
+@Serializable
+data class LearningPath(
+    val id: String,
+    val n: String,
+    val t: String = "",
+    val lv: String = "",
+    val m: List<PathModule> = emptyList(),
+)
 
 @Serializable
 data class Related(val m: List<String> = emptyList(), val p: List<String> = emptyList())
@@ -75,3 +88,11 @@ fun Video.hnLine(): String =
 
 fun Video.thumbUrl(): String = "https://i.ytimg.com/vi/$id/hq2.jpg"
 fun Video.watchUrl(): String = "https://www.youtube.com/watch?v=$id"
+
+fun Video.levelWord(): String =
+    when (level) {
+        "intro" -> "Beginner"
+        "intermediate" -> "Intermediate"
+        "advanced" -> "Advanced"
+        else -> ""
+    }

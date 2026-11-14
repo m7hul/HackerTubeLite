@@ -13,6 +13,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.decodeFromStream
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlin.random.Random
 
 enum class Sort(val label: String) {
@@ -44,6 +46,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var mentions by mutableStateOf<Map<String, List<Mention>>>(emptyMap())
         private set
+    var paths by mutableStateOf<List<LearningPath>>(emptyList())
+        private set
     private var index: Map<String, SearchEntry> = emptyMap()
 
     // ---- settings + personal lists (stored on this device only) ----
@@ -61,6 +65,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var later by mutableStateOf(readList("later"))
         private set
     var history by mutableStateOf(readList("history"))
+        private set
+    var watched by mutableStateOf(readList("watched"))
+        private set
+    var neuralEnabled by mutableStateOf(sp.getBoolean("neural", false))
         private set
 
     init {
@@ -84,6 +92,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 videos = loaded.first
             } catch (e: Exception) {
                 failed = true
+            }
+            try {
+                paths = withContext(Dispatchers.Default) { readAsset<List<LearningPath>>("paths.json") }
+            } catch (_: Exception) {
             }
             loading = false
 
@@ -211,6 +223,77 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         later = emptyList()
         saveList("liked", liked)
         saveList("later", later)
+    }
+
+    // ---- learning paths ----
+    fun lessonIds(p: LearningPath): List<String> = p.m.flatMap { it.l }.filter { it in byId }
+
+    fun progress(p: LearningPath): Pair<Int, Int> {
+        val ids = lessonIds(p)
+        return ids.count { it in watched } to ids.size
+    }
+
+    fun nextLesson(p: LearningPath): String? = lessonIds(p).firstOrNull { it !in watched }
+
+    fun toggleWatched(id: String) {
+        watched = if (id in watched) watched - id else listOf(id) + watched
+        saveList("watched", watched)
+    }
+
+    fun note(id: String): String = sp.getString("note_$id", "") ?: ""
+
+    fun saveNote(id: String, text: String) {
+        sp.edit().putString("note_$id", text).apply()
+    }
+
+    fun enableNeural(on: Boolean) {
+        neuralEnabled = on
+        sp.edit().putBoolean("neural", on).apply()
+        if (!on) NeuralEngine.stop()
+    }
+
+    // ---- backup ----
+    fun exportJson(): String {
+        val o = JSONObject()
+        o.put("app", "HackerTube")
+        o.put("version", 1)
+        o.put("watched", JSONArray(watched))
+        o.put("liked", JSONArray(liked))
+        o.put("later", JSONArray(later))
+        val notes = JSONObject()
+        for ((k, v) in sp.all) {
+            if (k.startsWith("note_") && v is String && v.isNotBlank()) notes.put(k.removePrefix("note_"), v)
+        }
+        o.put("notes", notes)
+        return o.toString(2)
+    }
+
+    fun importJson(text: String): Boolean {
+        return try {
+            val o = JSONObject(text)
+            if (o.optString("app") != "HackerTube") return false
+            fun ids(name: String): List<String> {
+                val a = o.optJSONArray(name) ?: return emptyList()
+                return (0 until a.length()).map { a.getString(it) }.filter { VIDEO_ID_REGEX.matches(it) }
+            }
+            watched = (watched + ids("watched")).distinct()
+            liked = (liked + ids("liked")).distinct()
+            later = (later + ids("later")).distinct()
+            saveList("watched", watched)
+            saveList("liked", liked)
+            saveList("later", later)
+            val n = o.optJSONObject("notes")
+            if (n != null) {
+                val e = sp.edit()
+                for (k in n.keys()) {
+                    if (VIDEO_ID_REGEX.matches(k)) e.putString("note_$k", n.optString(k))
+                }
+                e.apply()
+            }
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun readList(key: String): List<String> =

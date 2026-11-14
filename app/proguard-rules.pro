@@ -5,3 +5,6 @@
     kotlinx.serialization.KSerializer serializer(...);
 }
 -keep,includedescriptorclasses class com.example.hackertubelite.**$$serializer { *; }
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}

@@ -21,7 +21,7 @@ for v in kept:
     q=v.get('quote') or {}
     out.append({
       'i':v['vid'],'t':v['title'],'c':v['channel'],'s':v['summary'],'w':v['why_hn'],
-      'k':v['content_type'],'p':v['primary_topic'],'g':v['tags'][:4],
+      'k':v['content_type'],'lv':v.get('level','general'),'p':v['primary_topic'],'g':v['tags'][:4],
       'a':[c['id'] for c in v['categories']],
       'q':q.get('text') or '','qi':q.get('hn_comment_id') or 0,'qy':str(q.get('year') or ''),
       'f':v['hn']['first_year'],'l':v['hn']['last_year'],'r':v['hn']['recommenders'],
@@ -33,6 +33,34 @@ json.dump(out,open(OUT+'videos.json','w'),ensure_ascii=False,separators=(',',':'
 tx=json.load(open(D+'taxonomy.json'))
 tc=[{'id':a['id'],'n':a['name'],'c':[{'id':c['id'],'n':c['name']} for c in a['categories']]} for a in tx['areas']]
 json.dump(tc,open(OUT+'taxonomy.json','w'),ensure_ascii=False,separators=(',',':'))
+
+# ---- learning paths: one per topic area, modules = categories, lessons ordered easiest-first ----
+from collections import defaultdict
+LV={'intro':0,'general':1,'intermediate':2,'advanced':3}
+LVNAME={0:'Beginner',2:'Intermediate',3:'Advanced'}
+CT={'course':0,'tutorial':0,'explainer':0,'lecture':1,'talk':2,'documentary':3,'interview':3,'demo':4,'podcast':4}
+cand=[v for v in kept if v['shelf_life']!='news' and v['hn']['recommenders']>0]
+by_cat=defaultdict(list)
+for v in cand:
+    for c in v['categories']: by_cat[c['id']].append(v)
+paths=[]
+for a in tx['areas']:
+    used=set(); mods=[]
+    for c in a['categories']:
+        pool=[v for v in sorted(by_cat[c['id']],key=lambda v:-v['score']) if v['vid'] not in used][:6]
+        if len(pool)<3: continue
+        pool.sort(key=lambda v:(LV.get(v.get('level','general'),1),CT.get(v['content_type'],5),-v['score']))
+        used.update(v['vid'] for v in pool)
+        avg=sum(LV.get(v.get('level','general'),1) for v in pool)/len(pool)
+        mods.append((avg,-len(pool),c,pool))
+    if len(mods)<2: continue
+    mods.sort(key=lambda m:(m[0],m[1]))
+    lv=sorted({LV.get(v.get('level','general'),1) for m in mods for v in m[3]}-{1})
+    label='All levels' if not lv else (LVNAME[lv[0]] if len(lv)==1 else LVNAME[lv[0]]+' to '+LVNAME[lv[-1]])
+    paths.append({'id':a['id'],'n':a['name'],'t':' · '.join(m[2]['name'] for m in mods[:3]),'lv':label,
+                  'm':[{'id':m[2]['id'],'n':m[2]['name'],'l':[v['vid'] for v in m[3]]} for m in mods]})
+json.dump(paths,open(OUT+'paths.json','w'),ensure_ascii=False,separators=(',',':'))
+print('paths',[(p['n'],sum(len(m['l']) for m in p['m'])) for p in paths])
 
 # related: embedding neighbours + co-recommended
 emb=np.load(D+'embeddings.npy').astype(np.float32)

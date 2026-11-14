@@ -31,6 +31,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
@@ -48,6 +49,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -326,6 +328,9 @@ fun SettingsScreen(vm: AppViewModel) {
     val ctx = LocalContext.current
     val uri = LocalUriHandler.current
     var pending by remember { mutableStateOf<Pair<String, () -> Unit>?>(null) }
+    var importOpen by remember { mutableStateOf(false) }
+    var importText by remember { mutableStateOf("") }
+    var importMsg by remember { mutableStateOf("") }
     val version = remember {
         runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: ""
     }
@@ -374,6 +379,36 @@ fun SettingsScreen(vm: AppViewModel) {
             modifier = Modifier.padding(horizontal = 8.dp),
         ) { Text("Clear likes and watch later") }
 
+        SectionLabel("On-device AI (optional)", Modifier.padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 4.dp))
+        SwitchRow(
+            title = "Smarter answers with a small AI model",
+            subtitle = "Off by default. Turning it on downloads a model of about 100 MB from Hugging Face and loads code from jsDelivr, once. " +
+                "Your questions and notes are never uploaded; they are processed on this phone. " +
+                "Without it, answers come from HackerTube’s summaries and Hacker News comments and work fully offline.",
+            checked = vm.neuralEnabled,
+            onChange = { vm.enableNeural(it) },
+        )
+        if (vm.neuralEnabled) {
+            Text(
+                "Model status: " + NeuralEngine.status,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
+        }
+
+        SectionLabel("Progress backup", Modifier.padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 4.dp))
+        Text(
+            "Export your watched lessons, likes, watch-later list and notes as text, or import them on another phone.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        )
+        Row(Modifier.padding(horizontal = 8.dp)) {
+            TextButton(onClick = { shareText(ctx, "HackerTube progress", vm.exportJson()) }) { Text("Export") }
+            TextButton(onClick = { importOpen = true }) { Text("Import") }
+        }
+
         SectionLabel("About", Modifier.padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 8.dp))
         val body = MaterialTheme.typography.bodyMedium
         val muted = MaterialTheme.colorScheme.onSurfaceVariant
@@ -394,9 +429,17 @@ fun SettingsScreen(vm: AppViewModel) {
             "Videos play in YouTube’s official embedded player. Not affiliated with YouTube, Google, Hacker News, Y Combinator or HackerTube.",
             style = body, color = muted, modifier = Modifier.padding(horizontal = 16.dp),
         )
+        Spacer(Modifier.height(10.dp))
+        Text(
+            "Learning Paths, progress tracking and notes are inspired by HackerLearn by Preet Shukla (MIT licensed), " +
+                "which pioneered structured roadmaps built from the HackerTube catalog. No code was copied; " +
+                "the paths here are generated from the catalog’s topics and difficulty levels.",
+            style = body, color = muted, modifier = Modifier.padding(horizontal = 16.dp),
+        )
         Row(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
             TextButton(onClick = { uri.openUri("https://hackertube.org") }) { Text("hackertube.org") }
             TextButton(onClick = { uri.openUri("https://opendatacommons.org/licenses/by/1-0/") }) { Text("License") }
+            TextButton(onClick = { uri.openUri("https://github.com/PreetSHUKLA/hackerlearn") }) { Text("HackerLearn") }
         }
         if (version.isNotEmpty()) {
             Text(
@@ -405,6 +448,40 @@ fun SettingsScreen(vm: AppViewModel) {
                 modifier = Modifier.padding(horizontal = 16.dp),
             )
         }
+    }
+
+    if (importOpen) {
+        AlertDialog(
+            onDismissRequest = { importOpen = false },
+            title = { Text("Import progress") },
+            text = {
+                Column {
+                    Text("Paste the text you exported earlier.", style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = importText,
+                        onValueChange = { importText = it },
+                        modifier = Modifier.fillMaxWidth().height(160.dp),
+                    )
+                    if (importMsg.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(importMsg, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    importMsg = if (vm.importJson(importText)) "Imported." else "That doesn’t look like a HackerTube export."
+                }) { Text("Import") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    importOpen = false
+                    importMsg = ""
+                    importText = ""
+                }) { Text("Close") }
+            },
+        )
     }
 
     pending?.let { (message, action) ->
@@ -464,6 +541,7 @@ fun DetailScreen(
 
     val isLiked = id in vm.liked
     val isSaved = id in vm.later
+    val isWatched = id in vm.watched
     val rel = vm.related[id]
     val similar = remember(rel, vm.byId) { rel?.m.orEmpty().mapNotNull { vm.byId[it] } }
     val together = remember(rel, vm.byId) { rel?.p.orEmpty().mapNotNull { vm.byId[it] } }
@@ -504,6 +582,10 @@ fun DetailScreen(
                         if (isSaved) Icons.Filled.Check else Icons.Filled.Add,
                         if (isSaved) "Saved" else "Watch later", isSaved, Modifier.weight(1f),
                     ) { vm.toggleLater(id) }
+                    ActionItem(
+                        if (isWatched) Icons.Filled.CheckCircle else Icons.Filled.Check,
+                        if (isWatched) "Watched" else "Mark done", isWatched, Modifier.weight(1f),
+                    ) { vm.toggleWatched(id) }
                     ActionItem(Icons.Filled.Share, "Share", false, Modifier.weight(1f)) { share(ctx, video) }
                     ActionItem(Icons.Filled.PlayArrow, "YouTube", false, Modifier.weight(1f)) {
                         uri.openUri(video.watchUrl())
@@ -586,6 +668,8 @@ fun DetailScreen(
                     }
                 }
             }
+            item { AskPanel(vm, video, comments) }
+            item { NotesSection(vm, id) }
             if (comments.isNotEmpty()) {
                 item {
                     SectionLabel("From the comments", Modifier.padding(start = 16.dp, end = 16.dp, top = 28.dp))
@@ -645,6 +729,15 @@ private fun stanceLabel(stance: String): String = when (stance) {
     "rec" -> "RECOMMENDED"
     "critical" -> "CRITICAL"
     else -> "MENTIONED"
+}
+
+fun shareText(ctx: Context, subject: String, text: String) {
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, subject)
+        putExtra(Intent.EXTRA_TEXT, text)
+    }
+    ctx.startActivity(Intent.createChooser(send, null).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
 }
 
 private fun share(ctx: Context, v: Video) {

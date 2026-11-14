@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.List as ListIcon
 import androidx.compose.material3.Icon
@@ -44,12 +45,19 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 
-enum class NavTab(val label: String) { Home("Home"), Browse("Browse"), Library("Library"), Settings("Settings") }
+enum class NavTab(val label: String) {
+    Home("Home"),
+    Paths("Paths"),
+    Browse("Browse"),
+    Library("Library"),
+    Settings("Settings"),
+}
 
 sealed interface Screen {
     data object Search : Screen
     data class Category(val cat: Cat) : Screen
     data class Detail(val id: String) : Screen
+    data class PathView(val id: String) : Screen
 }
 
 class MainActivity : ComponentActivity(), FullscreenController {
@@ -139,6 +147,7 @@ fun Root(vm: AppViewModel) {
                                 Icon(
                                     when (t) {
                                         NavTab.Home -> Icons.Filled.Home
+                                        NavTab.Paths -> Icons.Filled.LocationOn
                                         NavTab.Browse -> Icons.Filled.ListIcon
                                         NavTab.Library -> Icons.Filled.Favorite
                                         NavTab.Settings -> Icons.Filled.Settings
@@ -169,6 +178,7 @@ fun Root(vm: AppViewModel) {
                             when (top) {
                                 is Screen.Search -> SearchScreen(vm, ::pop) { push(Screen.Detail(it)) }
                                 is Screen.Category -> CategoryScreen(vm, top.cat, ::pop) { push(Screen.Detail(it)) }
+                                is Screen.PathView -> PathDetailScreen(vm, top.id, ::pop) { push(Screen.Detail(it)) }
                                 is Screen.Detail -> DetailScreen(
                                     vm, top.id, ::pop,
                                     onOpen = { push(Screen.Detail(it)) },
@@ -179,6 +189,7 @@ fun Root(vm: AppViewModel) {
                     } else {
                         when (tab) {
                             NavTab.Home -> HomeScreen(vm, { push(Screen.Detail(it)) }, { push(Screen.Search) })
+                            NavTab.Paths -> PathsScreen(vm) { push(Screen.PathView(it)) }
                             NavTab.Browse -> BrowseScreen(vm, { push(Screen.Category(it)) }, { push(Screen.Search) })
                             NavTab.Library -> LibraryScreen(vm) { push(Screen.Detail(it)) }
                             NavTab.Settings -> SettingsScreen(vm)
