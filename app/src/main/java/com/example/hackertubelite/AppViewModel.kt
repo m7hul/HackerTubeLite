@@ -169,11 +169,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         sp.edit().putString("theme", m.name).apply()
     }
 
+    @JvmName("applyHideNews")
     fun setHideNews(b: Boolean) {
         hideNews = b
         sp.edit().putBoolean("hideNews", b).apply()
     }
 
+    @JvmName("applyIncludeCited")
     fun setIncludeCited(b: Boolean) {
         includeCited = b
         sp.edit().putBoolean("includeCited", b).apply()
